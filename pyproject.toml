@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 fni = "fast_numerical_integration.main:main"
+fni-bench = "fast_numerical_integration.benchmark:main"
 
 [dependency-groups]
 dev = [

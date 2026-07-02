@@ -43,8 +43,9 @@ Package layout (`src/` layout, ready for future C/Cython sources):
 ```
 src/fast_numerical_integration/
   three_body.py   # figure-eight ICs, three_body_rhs(t, y, masses, G), ThreeBodySystem
-  visualize.py    # plot_trajectories(solution, out_path) -> PNG (headless Agg backend)
+  visualize.py    # plot_trajectories(solution, out_path) -> PNG
   main.py         # main(): solve with solve_ivp, print stats, write outputs/figure_eight.png
+  benchmark.py    # solver-agnostic timing harness (RK23/RK45/DOP853, extensible to our engine)
 ```
 
 ## Quickstart
@@ -70,6 +71,30 @@ Saved plot ->  outputs/figure_eight.png
 The tiny energy drift over one period confirms the dynamics and initial
 conditions are correct.
 
+### Benchmark the baseline solvers
+
+```bash
+uv run fni-bench                               # or: uv run python -m fast_numerical_integration.benchmark
+```
+
+Times `solve_ivp` across `RK23`, `RK45`, and `DOP853` on the figure-eight system
+(one period, rtol=1e-10, atol=1e-12), reporting wall time, RHS evaluations, and
+accuracy (energy drift + how closely the periodic orbit closes). Representative
+run:
+
+```
+solver          best (ms)      mean±sd (ms)    nfev   eval/ms     E drift   period err
+--------------------------------------------------------------------------------------
+scipy RK23         649.11       656.13±4.58   43064      66.3    7.66e-10     6.93e-08
+scipy RK45          40.12        41.01±0.71    2936      73.2    2.98e-10     7.78e-08
+scipy DOP853        15.74        15.87±0.16    1202      76.4    2.61e-10     7.29e-08
+```
+
+At high accuracy the high-order **DOP853 is the target to beat** (~16 ms); the
+low-order RK23 needs ~43k RHS evaluations to reach the same tolerance. The
+harness is solver-agnostic, so the future custom engine drops straight into the
+same table. Numbers vary by machine.
+
 Run the tests:
 
 ```bash
@@ -79,7 +104,7 @@ uv run pytest
 ## Roadmap
 
 - [x] **Milestone 1** — SciPy `solve_ivp` figure-eight baseline + visualization.
-- [ ] **Milestone 2** — Benchmark harness timing `solve_ivp` across `RK23`,
+- [x] **Milestone 2** — Benchmark harness timing `solve_ivp` across `RK23`,
       `RK45`, and `DOP853` on the same system (baseline numbers to beat).
 - [ ] **Milestone 3** — Hand-written DOP853 / Runge-Kutta integrators in Python,
       validated against the SciPy reference.
