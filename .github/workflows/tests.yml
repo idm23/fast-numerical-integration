@@ -25,6 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Stock-SciPy comparisons are sensitive to the BLAS kernel NumPy picks
+      # for the CPU; log the hardware so discrepancies are diagnosable.
+      - name: Runner CPU
+        run: lscpu | grep -E "Model name|Flags" | cut -c1-200
+
       - name: Set up uv and Python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@v6
         with:
