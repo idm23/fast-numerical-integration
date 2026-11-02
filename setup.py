@@ -33,6 +33,11 @@ extensions = [
         ["src/fast_numerical_integration/nbody.pyx"],
         **common,
     ),
+    Extension(
+        "fast_numerical_integration.problems.native",
+        ["src/fast_numerical_integration/problems/native.pyx"],
+        **common,
+    ),
 ]
 
 setup(
@@ -41,5 +46,8 @@ setup(
         compiler_directives=COMPILER_DIRECTIVES,
         include_path=["src"],
     ),
-    package_data={"fast_numerical_integration": ["*.pxd", "*.pyx"]},
+    package_data={
+        "fast_numerical_integration": ["*.pxd", "*.pyx"],
+        "fast_numerical_integration.problems": ["*.pyx"],
+    },
 )
