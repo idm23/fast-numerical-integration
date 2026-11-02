@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from fast_numerical_integration.nbody import NBodyGravity
+
 N_BODIES = 3
 N_DIMS = 2
 STATE_SIZE = 2 * N_BODIES * N_DIMS  # positions + velocities = 12
@@ -133,6 +135,12 @@ class ThreeBodySystem:
     def rhs(self, t: float, y: np.ndarray) -> np.ndarray:
         """``f(t, y)`` closure ready for ``solve_ivp`` or our own integrators."""
         return three_body_rhs(t, y, self.masses, self.G)
+
+    def native_rhs(self) -> NBodyGravity:
+        """Compiled RHS for the Cython integrators (same physics as :meth:`rhs`)."""
+        return NBodyGravity(
+            self.masses, G=self.G, n_dims=N_DIMS, softening2=_SOFTENING2
+        )
 
     def energy(self, y: np.ndarray) -> float:
         """Total mechanical energy of state ``y``."""

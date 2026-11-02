@@ -38,22 +38,86 @@ with `scipy.integrate.solve_ivp` (DOP853) and saves a static trajectory plot.
 This gives us a **correct reference solution** and a **timing target** for the
 custom engine that follows.
 
-Package layout (`src/` layout, ready for future C/Cython sources):
+**Milestone 3 — Cython integrators (done).** `RK23`, `RK45`, and `DOP853` are
+reimplemented in Cython as a step-for-step copy of SciPy's `RungeKutta`
+solvers. They use the same tableaus, initial-step heuristic, error norms, and
+step-size controller, so they accept the same steps and make the same number of
+RHS evaluations as `solve_ivp`. State-sized work is done in typed-memoryview loops
+over buffers that cnumpy allocates once per solve. The step loop makes no NumPy
+calls and creates no temporary arrays. Right-hand sides are `cdef` subclasses of
+`OdeSystem`, and the integrator calls them through the vtable. A Python callable
+also works through an adapter, which is slower.
+
+**Milestone 3b — the rest of `solve_ivp` (done).** `t_eval`, `dense_output`
+(an `OdeSolution`), `events` (`terminal` as a bool or a count, plus
+`direction`), `vectorized`, `args`, per-component `rtol`/`atol`, `first_step`,
+`max_step`, and SciPy's validation and warnings are all supported. Output
+points, interpolants, and event times and states match SciPy to round-off,
+with identical RHS evaluation counts. That includes DOP853's 3 extra
+dense-output stages, which are evaluated only when an interpolant is needed.
+Event roots are found with a C port of SciPy's `brentq`. Events can be native
+`EventFunction` subclasses, such as the built-in `ComponentCrossing`, so a fully
+compiled problem never calls into Python. The stepper classes mirror
+`scipy.integrate.OdeSolver` (`step()`, `dense_output()`, `t_old`, `step_size`).
+Not supported: complex-valued `y0`.
+
+Package layout (`src/` layout):
 
 ```
 src/fast_numerical_integration/
-  three_body.py   # figure-eight ICs, three_body_rhs(t, y, masses, G), ThreeBodySystem
-  visualize.py    # plot_trajectories(solution, out_path) -> PNG
-  main.py         # main(): solve with solve_ivp, print stats, write outputs/figure_eight.png
-  benchmark.py    # solver-agnostic timing harness (RK23/RK45/DOP853, extensible to our engine)
+  integrators.pyx/.pxd  # OdeSystem, RK23/RK45/DOP853 steppers, solve_ivp (Cython)
+  nbody.pyx             # NBodyGravity: native N-body RHS (stand-in for generated C)
+  tableaus.py           # Butcher tableaus, bit-identical to SciPy's
+  three_body.py         # figure-eight ICs, three_body_rhs, ThreeBodySystem(.native_rhs())
+  visualize.py          # plot_trajectories(solution, out_path) -> PNG
+  main.py               # main(): solve with solve_ivp, print stats, write outputs/figure_eight.png
+  benchmark.py          # timing harness: scipy vs cython (Python RHS) vs cython (native RHS)
+setup.py                # Cython extension build (metadata stays in pyproject.toml)
 ```
+
+### Using the Cython engine
+
+`integrators.solve_ivp` takes the same arguments as `scipy.integrate.solve_ivp`
+(default method `RK45`):
+
+```python
+import numpy as np
+from fast_numerical_integration.integrators import ComponentCrossing, solve_ivp
+from fast_numerical_integration.three_body import figure_eight_system
+
+system = figure_eight_system()
+sol = solve_ivp(
+    system.native_rhs(), (0.0, system.period), system.y0, method="DOP853",
+    t_eval=np.linspace(0.0, system.period, 2000), dense_output=True,
+    events=[ComponentCrossing(1, direction=1)],    # y1 crosses 0 upward
+    rtol=1e-10, atol=1e-12,
+)
+sol.t, sol.y              # solution at t_eval
+sol.sol(1.234)            # dense interpolant anywhere in the interval
+sol.t_events, sol.y_events
+```
+
+Plain Python RHS and event callables also work, with SciPy's `terminal` and
+`direction` attributes. They are slower because every call goes back through
+Python.
+
+To write a native RHS or event, subclass `OdeSystem` or `EventFunction` in a
+`.pyx` file and implement its `cdef eval`:
+
+```cython
+cdef int eval(self, double t, const double* y, double* dydt, Py_ssize_t n) except -1   # OdeSystem
+cdef double eval(self, double t, const double* y, Py_ssize_t n) except? -1              # EventFunction
+```
+
+`nbody.pyx` is an example. The SymPy-generated C kernels in later milestones will
+plug in through the same hook.
 
 ## Quickstart
 
 Requires [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync                                        # create the venv and install deps
+uv sync                                        # create the venv, install deps, compile Cython
 uv run fni                                     # or: uv run python -m fast_numerical_integration.main
 ```
 
@@ -71,29 +135,45 @@ Saved plot ->  outputs/figure_eight.png
 The tiny energy drift over one period confirms the dynamics and initial
 conditions are correct.
 
-### Benchmark the baseline solvers
+The Cython extensions build when the package installs. `uv` tracks the `.pyx` and
+`.pxd` files as cache keys, so `uv sync` or `uv run` rebuilds them after an
+edit. Building needs a C compiler.
+
+### Benchmark
 
 ```bash
 uv run fni-bench                               # or: uv run python -m fast_numerical_integration.benchmark
 ```
 
-Times `solve_ivp` across `RK23`, `RK45`, and `DOP853` on the figure-eight system
-(one period, rtol=1e-10, atol=1e-12), reporting wall time, RHS evaluations, and
-accuracy (energy drift + how closely the periodic orbit closes). Representative
-run:
+Times `RK23`, `RK45`, and `DOP853` on the figure-eight system (one period,
+rtol=1e-10, atol=1e-12) with three engines:
+
+- `scipy`: `scipy.integrate.solve_ivp`.
+- `cython+pyrhs`: the Cython integrators calling the NumPy RHS through Python.
+  The RHS cost matches SciPy's, so this measures integrator overhead alone.
+- `cython`: the Cython integrators with the native `NBodyGravity` RHS.
+
+Representative run:
 
 ```
-solver          best (ms)      mean±sd (ms)    nfev   eval/ms     E drift   period err
---------------------------------------------------------------------------------------
-scipy RK23         649.11       656.13±4.58   43064      66.3    7.66e-10     6.93e-08
-scipy RK45          40.12        41.01±0.71    2936      73.2    2.98e-10     7.78e-08
-scipy DOP853        15.74        15.87±0.16    1202      76.4    2.61e-10     7.29e-08
+solver                 best (ms)      mean±sd (ms)    nfev   eval/ms     E drift   period err
+---------------------------------------------------------------------------------------------
+scipy RK23               626.758    636.353±10.984   43064      68.7    7.66e-10     6.93e-08
+cython+pyrhs RK23        432.419     435.549±2.256   43064      99.6    7.67e-10     6.93e-08
+cython RK23                3.747       3.966±0.299   43064   11494.1    7.67e-10     6.93e-08
+scipy RK45                39.150      39.270±0.093    2936      75.0    2.98e-10     7.78e-08
+cython+pyrhs RK45         29.834      31.064±1.231    2936      98.4    2.98e-10     7.78e-08
+cython RK45                0.201       0.207±0.005    2936   14633.5    2.98e-10     7.78e-08
+scipy DOP853              15.282      15.353±0.060    1202      78.7    2.61e-10     7.29e-08
+cython+pyrhs DOP853       12.178      12.234±0.037    1202      98.7    2.61e-10     7.29e-08
+cython DOP853              0.086       0.091±0.003    1202   13906.7    2.61e-10     7.29e-08
 ```
 
-At high accuracy the high-order **DOP853 is the target to beat** (~16 ms); the
-low-order RK23 needs ~43k RHS evaluations to reach the same tolerance. The
-harness is solver-agnostic, so the future custom engine drops straight into the
-same table. Numbers vary by machine.
+The Cython engine makes exactly the same number of RHS evaluations as SciPy and
+reaches the same accuracy. With a native RHS, DOP853 runs about **175x faster**
+than `solve_ivp`. With the Python RHS the gain is only ~1.3x, so most of SciPy's
+time is spent calling the Python RHS. That is why the remaining milestones
+generate compiled kernels. Numbers vary by machine.
 
 Run the tests:
 
@@ -106,11 +186,13 @@ uv run pytest
 - [x] **Milestone 1** — SciPy `solve_ivp` figure-eight baseline + visualization.
 - [x] **Milestone 2** — Benchmark harness timing `solve_ivp` across `RK23`,
       `RK45`, and `DOP853` on the same system (baseline numbers to beat).
-- [ ] **Milestone 3** — Hand-written DOP853 / Runge-Kutta integrators in Python,
-      validated against the SciPy reference.
+- [x] **Milestone 3** — Cython RK23 / RK45 / DOP853 with adaptive steps, matching
+      SciPy step for step; native `OdeSystem` RHS interface.
+- [x] **Milestone 3b** — Dense output, `t_eval`, events, and the rest of
+      SciPy's `solve_ivp` options for these methods.
 - [ ] **Milestone 4** — SymPy → C code printing for the RHS.
-- [ ] **Milestone 5** — Cython build bridge compiling the generated C and exposing
-      a fast integration loop; benchmark against the baseline.
+- [ ] **Milestone 5** — Build glue that compiles the generated C into an
+      `OdeSystem` subclass; benchmark against the baseline.
 
 ## License
 

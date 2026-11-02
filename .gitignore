@@ -219,3 +219,7 @@ __marimo__/
 
 # Generated visualization output
 *.png
+
+# Cython-generated C (regenerated from .pyx on build)
+src/fast_numerical_integration/integrators.c
+src/fast_numerical_integration/nbody.c
