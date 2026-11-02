@@ -34,6 +34,11 @@ extensions = [
         **common,
     ),
     Extension(
+        "fast_numerical_integration.batch",
+        ["src/fast_numerical_integration/batch.pyx"],
+        **common,
+    ),
+    Extension(
         "fast_numerical_integration.problems.native",
         ["src/fast_numerical_integration/problems/native.pyx"],
         **common,

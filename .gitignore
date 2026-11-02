@@ -223,6 +223,7 @@ __marimo__/
 # Cython-generated C (regenerated from .pyx on build)
 src/fast_numerical_integration/integrators.c
 src/fast_numerical_integration/nbody.c
+src/fast_numerical_integration/batch.c
 src/fast_numerical_integration/problems/native.c
 
 # Benchmark-suite output (figures, tables)

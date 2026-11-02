@@ -2,91 +2,210 @@
 #
 # Public C-level interface of the Cython integration engine.
 #
-# Other extension modules (hand-written systems today, SymPy-generated C kernels
-# later) ``cimport`` this file and subclass :class:`OdeSystem` (right-hand sides)
-# or :class:`EventFunction` (event functions), overriding ``eval``. The engine
-# calls ``eval`` through the vtable, so native systems and events never enter the
-# Python interpreter inside the step loop.
+# Two layers:
+#
+# 1. A plain-C, GIL-free core (``fni_*``): right-hand sides and event functions
+#    are C function pointers plus an opaque context pointer, and the solver is a
+#    C struct. ``fni_integrate`` runs a whole integration (with events) without
+#    touching Python, so other Cython modules can call it inside ``with nogil``,
+#    from threads, or in tight loops such as multiple shooting.
+#
+# 2. Python-facing extension types built on that core. :class:`OdeSystem` and
+#    :class:`EventFunction` are subclassed in Cython (hand-written systems, or
+#    generated kernels) and carry a runtime ``params`` vector. A subclass that
+#    sets ``c_fn``/``c_ctx`` to a ``nogil`` C function is usable from both layers.
+#
+# Thread safety: the core keeps all solver state in the ``fni_solver`` struct,
+# so concurrent integrations are safe as long as the user's ``c_fn``
+# functions are reentrant (no shared scratch buffers) and ``params`` is not
+# modified while they run.
 
+
+# =============================================================================
+# Plain-C core
+# =============================================================================
+
+# dy/dt = f(t, y; ctx). Write n values into dydt; return 0 on success, nonzero
+# on failure (the integration stops with FNI_ERR_CALLBACK).
+ctypedef int (*fni_rhs_fn)(double t, const double* y, double* dydt, Py_ssize_t n,
+                           void* ctx) noexcept nogil
+
+# Event function g(t, y; ctx): write the value into *g; return 0 on success.
+ctypedef int (*fni_event_fn)(double t, const double* y, Py_ssize_t n, void* ctx,
+                             double* g) noexcept nogil
+
+cdef enum:
+    # methods
+    FNI_RK23 = 0
+    FNI_RK45 = 1
+    FNI_DOP853 = 2
+
+cdef enum:
+    # solver status
+    FNI_RUNNING = 0
+    FNI_FINISHED = 1
+    FNI_FAILED = -1          # required step size below floating-point spacing
+
+cdef enum:
+    # integration outcome (fni_stats.status, mirrors solve_ivp's status)
+    FNI_STATUS_FAILED = -1
+    FNI_STATUS_FINISHED = 0
+    FNI_STATUS_EVENT = 1     # terminated by a terminal event
+
+cdef enum:
+    # return codes (0 = success)
+    FNI_OK = 0
+    FNI_ERR_CALLBACK = -1    # a RHS or event function returned nonzero
+    FNI_ERR_ALLOC = -2
+    FNI_ERR_ARG = -3         # invalid argument (e.g. max_step <= 0)
+    FNI_ERR_ROOT_SIGN = -4   # event root bracket without a sign change
+    FNI_ERR_ROOT_CONV = -5   # event root finding did not converge
+
+cdef enum:
+    FNI_DENSE_RK = 0         # y_old + h * sum_k Q[k] x^(k+1)
+    FNI_DENSE_DOP853 = 1     # nested Hairer-Wanner form
+
+cdef struct fni_tableau:
+    int method
+    int order
+    int error_estimator_order
+    Py_ssize_t n_stages
+    Py_ssize_t n_k_rows      # stages + FSAL row (+ DOP853's 3 dense-only stages)
+    int dense_kind
+    Py_ssize_t n_dense_coef
+    const double* A          # row-major, row stride a_stride (covers all n_k_rows stages)
+    Py_ssize_t a_stride
+    const double* B          # n_stages
+    const double* C          # n_k_rows
+    const double* E          # n_stages + 1 (DOP853: E5)
+    const double* E3         # DOP853 only, else NULL
+    const double* P          # RK23/RK45 dense matrix, (n_stages + 1) x n_dense_coef
+    const double* D          # DOP853 dense matrix, (n_dense_coef - 3) x n_k_rows
+
+cdef struct fni_options:
+    double rtol              # used when rtol_vec is NULL (clamped to >= 100 eps)
+    const double* rtol_vec   # optional, length n
+    double atol              # used when atol_vec is NULL
+    const double* atol_vec   # optional, length n
+    double first_step        # <= 0: choose automatically (scipy's heuristic)
+    double max_step          # > 0 (INFINITY for no limit)
+
+cdef struct fni_solver:
+    const fni_tableau* tab
+    fni_rhs_fn fun
+    void* ctx
+    Py_ssize_t n
+    double t
+    double t_bound
+    double direction
+    double max_step
+    double t_old
+    bint has_t_old
+    double h_abs
+    double h_previous
+    double error_exponent
+    int status               # FNI_RUNNING / FNI_FINISHED / FNI_FAILED
+    bint dense_valid
+    Py_ssize_t nfev
+    Py_ssize_t n_accepted
+    Py_ssize_t n_rejected
+    double* mem              # single allocation backing every buffer below
+    double* y
+    double* y_old
+    double* f
+    double* y_new
+    double* y_stage
+    double* scale
+    double* atol
+    double* rtol
+    double* K                # n_k_rows x n
+    double* dense            # n_dense_coef x n
+
+cdef struct fni_event:
+    fni_event_fn fn
+    void* ctx
+    double direction         # >0: increasing only, <0: decreasing only, 0: both
+    double max_events        # terminate after this many occurrences (INFINITY: never)
+
+cdef struct fni_stats:
+    int status               # FNI_STATUS_*
+    double t_final
+    Py_ssize_t nfev
+    Py_ssize_t n_accepted
+    Py_ssize_t n_rejected
+    Py_ssize_t n_records     # events found (may exceed the record capacity)
+
+cdef const fni_tableau* fni_get_tableau(int method) noexcept nogil
+cdef int fni_solver_init(fni_solver* s, int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
+                         double t0, const double* y0, double t_bound,
+                         const fni_options* opt) noexcept nogil
+cdef void fni_solver_free(fni_solver* s) noexcept nogil
+cdef int fni_solver_step(fni_solver* s) noexcept nogil
+cdef int fni_solver_ensure_dense(fni_solver* s) noexcept nogil
+cdef void fni_solver_dense_eval(const fni_solver* s, double t, double* out) noexcept nogil
+cdef int fni_events_eval(const fni_event* events, Py_ssize_t n_events, double t,
+                         const double* y, Py_ssize_t n, double* g) noexcept nogil
+cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                          const double* g, double* g_new, double* counts,
+                          Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
+                          bint* terminate, double* buf) noexcept nogil
+cdef int fni_integrate(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
+                       double t0, const double* y0, double t1, const fni_options* opt,
+                       const fni_event* events, Py_ssize_t n_events,
+                       double* y_out, Py_ssize_t* record_event, double* record_t,
+                       double* record_y, Py_ssize_t max_records,
+                       fni_stats* stats) noexcept nogil
+
+
+# =============================================================================
+# Python-facing extension types
+# =============================================================================
 
 cdef class OdeSystem:
-    # Number of state variables this system expects, or -1 if any size is valid
-    # (e.g. a wrapped Python callable that adapts to ``y0``).
+    # Number of state variables this system expects, or -1 if any size is valid.
     cdef readonly Py_ssize_t n_states
+    # Runtime parameters: change them between solves (continuation) without
+    # recompiling. Subclasses read self._params[i] (or receive a pointer via
+    # c_ctx); the buffer is never reallocated after _init_params.
+    cdef readonly Py_ssize_t n_params
+    cdef readonly tuple param_names
+    cdef double[::1] _params
+    # Optional GIL-free implementation. When set, the engine calls it directly
+    # (and fni_integrate can run without the GIL); eval() then defaults to it.
+    cdef fni_rhs_fn c_fn
+    cdef void* c_ctx
 
-    # Write dy/dt = f(t, y) into ``dydt``. Both buffers hold ``n`` contiguous
-    # doubles. Return 0 on success; return -1 with a Python exception set on
-    # failure (the integrator propagates it).
+    cdef int _init_params(self, values, names=*) except -1
+    cdef double* _params_ptr(self) noexcept
+    # Validate a state size before integrating; raises on mismatch.
+    cdef int check_size(self, Py_ssize_t n) except -1
+    # Write dy/dt = f(t, y) into ``dydt``. Return 0, or -1 with an exception set.
     cdef int eval(self, double t, const double* y, double* dydt, Py_ssize_t n) except -1
 
 
 cdef class EventFunction:
-    # Same meaning as the ``terminal`` / ``direction`` attributes scipy reads
-    # from event callables: ``terminal`` is False/True or a positive int (number
-    # of occurrences that terminate the integration); ``direction`` selects
-    # zero crossings by sign of slope (0 = both).
+    # ``terminal`` is False/True or a positive int (occurrences that terminate
+    # the integration); ``direction`` selects crossings by sign of slope.
     cdef public object terminal
     cdef public double direction
+    cdef readonly Py_ssize_t n_params
+    cdef readonly tuple param_names
+    cdef double[::1] _params
+    cdef fni_event_fn c_fn
+    cdef void* c_ctx
 
+    cdef int _init_params(self, values, names=*) except -1
+    cdef double* _params_ptr(self) noexcept
+    cdef int check_size(self, Py_ssize_t n) except -1
     # Return g(t, y); events are located at sign changes of g.
     cdef double eval(self, double t, const double* y, Py_ssize_t n) except? -1
 
 
 cdef class RungeKutta:
-    # --- problem ---
+    cdef fni_solver s
+    cdef int method
     cdef OdeSystem system
-    cdef readonly Py_ssize_t n
-    cdef readonly double t
-    cdef readonly double t_bound
-    cdef readonly double direction
-    cdef double max_step
-    cdef double _t_old
-    cdef bint _has_t_old
-
-    # --- method (Butcher tableau, read-only views onto module constants) ---
-    cdef readonly Py_ssize_t n_stages
-    cdef readonly int order
-    cdef readonly int error_estimator_order
-    cdef double error_exponent
-    cdef const double[:, ::1] A
-    cdef const double[::1] B
-    cdef const double[::1] C
-    cdef const double[::1] E
-    cdef const double[:, ::1] P   # RK23/RK45 dense-output matrix
-    cdef Py_ssize_t n_k_rows      # rows of K (DOP853 keeps 3 extra dense stages)
-
-    # --- dense output for the last accepted step ---
-    cdef int dense_kind
-    cdef Py_ssize_t n_dense_coef
-    cdef double[:, ::1] dense_coef  # (n_dense_coef, n)
-    cdef bint dense_valid
-
-    # --- working storage (allocated once, reused every step) ---
-    cdef double[:, ::1] K       # (n_k_rows, n): stages + FSAL derivative (+ extras)
-    cdef double[::1] _y         # current state
-    cdef double[::1] _y_old     # state at the start of the last step
-    cdef double[::1] _f         # f(t, y)
-    cdef double[::1] _y_new     # candidate state at t + h
-    cdef double[::1] _y_stage   # scratch for stage arguments
-    cdef double[::1] _scale     # atol + rtol * max(|y|, |y_new|)
-    cdef double[::1] _atol      # per-component absolute tolerance
-    cdef double[::1] _rtol      # per-component relative tolerance
-
-    # --- adaptive step state / statistics ---
-    cdef readonly double h_abs
-    cdef double h_previous
-    cdef readonly Py_ssize_t nfev
-    cdef readonly Py_ssize_t n_accepted
-    cdef readonly Py_ssize_t n_rejected
-    cdef int _status            # STATUS_RUNNING | STATUS_FINISHED | STATUS_FAILED
     cdef readonly str message   # failure reason, or None
 
-    cdef int _fun(self, double t, const double* y, double* dydt) except -1
-    cdef double _select_initial_step(self) except -1.0
-    cdef int _rk_stages(self, double h) except -1
-    cdef double _error_norm(self, double h)
-    cdef int _step_impl(self) except -1
     cdef int _step(self) except -1
-    cdef int _build_dense(self) except -1
     cdef int _ensure_dense(self) except -1
-    cdef void _dense_eval(self, double t, double* out) noexcept

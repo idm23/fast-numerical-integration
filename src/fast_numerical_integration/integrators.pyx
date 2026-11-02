@@ -8,24 +8,36 @@ initial-step heuristic, the same error norms and the same step-size controller
 same number of RHS evaluations as SciPy. Differences are limited to
 floating-point summation order.
 
+Architecture
+------------
+All numerics live in a plain-C, GIL-free core (the ``fni_*`` functions
+declared in ``integrators.pxd``): a solver struct, single-step and
+dense-output routines, event detection with Brent root finding, and
+``fni_integrate``, which runs a whole integration. Right-hand sides and events
+are C function pointers plus a context pointer. Other Cython modules can
+``cimport`` the core and call it inside ``with nogil`` (multiple shooting,
+threads, tight loops).
+
+The Python layer (:func:`solve_ivp`, the stepper classes, :func:`integrate`)
+is a thin wrapper over that single core, so both paths take bit-identical
+steps. :class:`OdeSystem` / :class:`EventFunction` subclasses that provide a
+``nogil`` C function (``c_fn``) are called directly. Python callables and
+Cython ``eval`` overrides are reached through a trampoline that holds the GIL.
+
 Supported ``solve_ivp`` features: ``t_eval``, ``dense_output`` (returns an
 :class:`OdeSolution`), ``events`` (terminal as a bool or count, plus direction;
 roots found by Brent's method on the dense interpolant), ``vectorized``,
 ``args``, ``first_step``, ``max_step``, and scalar or per-component
-``rtol``/``atol``. The stepper classes mirror ``scipy.integrate.OdeSolver``
-(``step()``, ``dense_output()``, ``t_old``, ``step_size``, ...).
+``rtol``/``atol``. Native systems and events also carry a runtime ``params``
+vector for continuation without recompiling.
 
 Not supported: complex-valued ``y0``.
-
-Every state-sized operation is a typed-memoryview loop over arrays that cnumpy
-allocates once per solve. The step loop makes no NumPy calls and creates no
-temporary arrays. Native right-hand sides (:class:`OdeSystem`) and native events
-(:class:`EventFunction`) are called through the vtable, so a fully native
-problem runs without entering the Python interpreter except to record results.
 """
 
 cimport numpy as cnp
-from libc.math cimport fabs, sqrt, pow, nextafter, INFINITY
+from cpython.exc cimport PyErr_Occurred
+from libc.math cimport fabs, sqrt, pow, nextafter, INFINITY, NAN
+from libc.stdlib cimport malloc, free
 from libc.string cimport memcpy
 
 import warnings
@@ -41,26 +53,18 @@ cdef double SAFETY = 0.9
 cdef double MIN_FACTOR = 0.2
 cdef double MAX_FACTOR = 10.0
 
-cdef double EPS = np.finfo(np.float64).eps
+cdef double EPS = 2.220446049250313e-16   # np.finfo(float).eps
 cdef int BRENTQ_MAXITER = 100
 
-cdef enum:
-    STATUS_RUNNING = 0
-    STATUS_FINISHED = 1
-    STATUS_FAILED = -1
-
-cdef enum:
-    DENSE_RK = 0       # y_old + h * sum_k Q[k] x^(k+1)
-    DENSE_DOP853 = 1   # nested Hairer-Wanner form over F[0..6]
-
-_STATUS_NAMES = {STATUS_RUNNING: "running", STATUS_FINISHED: "finished",
-                 STATUS_FAILED: "failed"}
+_STATUS_NAMES = {FNI_RUNNING: "running", FNI_FINISHED: "finished", FNI_FAILED: "failed"}
 
 MESSAGES = {
     0: "The solver successfully reached the end of the integration interval.",
     1: "A termination event occurred.",
 }
 MSG_TOO_SMALL_STEP = "Required step size is less than spacing between numbers."
+
+METHOD_IDS = {"RK23": FNI_RK23, "RK45": FNI_RK45, "DOP853": FNI_DOP853}
 
 
 cdef inline cnp.ndarray _empty1d(Py_ssize_t n):
@@ -84,7 +88,89 @@ cdef inline cnp.ndarray _array_from(const double* src, Py_ssize_t n):
     return out
 
 
-cdef inline double _rms_norm_scaled(const double* x, const double* scale, Py_ssize_t n) noexcept:
+# =============================================================================
+# Tableaus (module-level C structs pointing into kept-alive NumPy arrays)
+# =============================================================================
+
+cdef fni_tableau _TABLEAUS[3]
+_TABLEAU_ARRAYS = []   # keeps the coefficient buffers alive
+
+
+cdef const double* _keep(arr):
+    a = np.ascontiguousarray(arr, dtype=np.float64)
+    _TABLEAU_ARRAYS.append(a)
+    return <const double*> cnp.PyArray_DATA(a)
+
+
+cdef void _init_tableaus():
+    cdef fni_tableau* t = &_TABLEAUS[FNI_RK23]
+    t.method = FNI_RK23
+    t.order = tableaus.RK23_ORDER
+    t.error_estimator_order = tableaus.RK23_ERROR_ESTIMATOR_ORDER
+    t.n_stages = tableaus.RK23_N_STAGES
+    t.n_k_rows = t.n_stages + 1
+    t.dense_kind = FNI_DENSE_RK
+    t.n_dense_coef = tableaus.RK23_P.shape[1]
+    t.A = _keep(tableaus.RK23_A)
+    t.a_stride = tableaus.RK23_A.shape[1]
+    t.B = _keep(tableaus.RK23_B)
+    t.C = _keep(tableaus.RK23_C)
+    t.E = _keep(tableaus.RK23_E)
+    t.E3 = NULL
+    t.P = _keep(tableaus.RK23_P)
+    t.D = NULL
+
+    t = &_TABLEAUS[FNI_RK45]
+    t.method = FNI_RK45
+    t.order = tableaus.RK45_ORDER
+    t.error_estimator_order = tableaus.RK45_ERROR_ESTIMATOR_ORDER
+    t.n_stages = tableaus.RK45_N_STAGES
+    t.n_k_rows = t.n_stages + 1
+    t.dense_kind = FNI_DENSE_RK
+    t.n_dense_coef = tableaus.RK45_P.shape[1]
+    t.A = _keep(tableaus.RK45_A)
+    t.a_stride = tableaus.RK45_A.shape[1]
+    t.B = _keep(tableaus.RK45_B)
+    t.C = _keep(tableaus.RK45_C)
+    t.E = _keep(tableaus.RK45_E)
+    t.E3 = NULL
+    t.P = _keep(tableaus.RK45_P)
+    t.D = NULL
+
+    t = &_TABLEAUS[FNI_DOP853]
+    t.method = FNI_DOP853
+    t.order = tableaus.DOP853_ORDER
+    t.error_estimator_order = tableaus.DOP853_ERROR_ESTIMATOR_ORDER
+    t.n_stages = tableaus.DOP853_N_STAGES
+    t.n_k_rows = tableaus.DOP853_N_STAGES_EXTENDED
+    t.dense_kind = FNI_DENSE_DOP853
+    t.n_dense_coef = tableaus.DOP853_INTERPOLATOR_POWER
+    # The full 16x16 matrix: its leading 12x12 block is the main tableau and
+    # rows 13-15 are the dense-output stages.
+    t.A = _keep(tableaus.DOP853_A)
+    t.a_stride = tableaus.DOP853_A.shape[1]
+    t.B = _keep(tableaus.DOP853_B)
+    t.C = _keep(tableaus.DOP853_C)
+    t.E = _keep(tableaus.DOP853_E5)
+    t.E3 = _keep(tableaus.DOP853_E3)
+    t.P = NULL
+    t.D = _keep(tableaus.DOP853_D)
+
+
+_init_tableaus()
+
+
+cdef const fni_tableau* fni_get_tableau(int method) noexcept nogil:
+    if method < FNI_RK23 or method > FNI_DOP853:
+        return NULL
+    return &_TABLEAUS[method]
+
+
+# =============================================================================
+# Plain-C core
+# =============================================================================
+
+cdef inline double _rms_norm_scaled(const double* x, const double* scale, Py_ssize_t n) noexcept nogil:
     """RMS norm of ``x / scale`` (scipy's ``norm(x / scale)``)."""
     cdef Py_ssize_t i
     cdef double v, acc = 0.0
@@ -96,7 +182,7 @@ cdef inline double _rms_norm_scaled(const double* x, const double* scale, Py_ssi
 
 cdef void _interp_eval(int kind, Py_ssize_t ncoef, Py_ssize_t n, double t_old,
                        double h, const double* y_old, const double* coef,
-                       double t, double* out) noexcept:
+                       double t, double* out) noexcept nogil:
     """Evaluate one step's dense-output polynomial at ``t``.
 
     ``coef`` is (ncoef, n) row-major. ``h == 0`` is the constant interpolant
@@ -109,7 +195,7 @@ cdef void _interp_eval(int kind, Py_ssize_t ncoef, Py_ssize_t n, double t_old,
             memcpy(out, y_old, n * sizeof(double))
         return
     x = (t - t_old) / h
-    if kind == DENSE_RK:
+    if kind == FNI_DENSE_RK:
         # Horner form of h * sum_k coef[k] x^(k+1).
         for i in range(n):
             acc = coef[(ncoef - 1) * n + i]
@@ -129,6 +215,728 @@ cdef void _interp_eval(int kind, Py_ssize_t ncoef, Py_ssize_t n, double t_old,
             out[i] = acc + y_old[i]
 
 
+cdef inline int _fun(fni_solver* s, double t, const double* y, double* dydt) noexcept nogil:
+    s.nfev += 1
+    if s.fun(t, y, dydt, s.n, s.ctx) != 0:
+        return FNI_ERR_CALLBACK
+    return FNI_OK
+
+
+cdef int _select_initial_step(fni_solver* s, double* h_out) noexcept nogil:
+    """Hairer-Norsett-Wanner initial step heuristic (scipy's select_initial_step)."""
+    cdef Py_ssize_t i, n = s.n
+    cdef double interval_length = fabs(s.t_bound - s.t)
+    cdef double d0, d1, d2, h0, h1
+    cdef double* y0 = s.y
+    cdef double* f0 = s.f
+    cdef double* scale = s.scale
+    cdef double* y1 = s.y_new
+    cdef double* f1 = s.K          # free scratch before the first step
+    cdef double* diff = s.y_stage
+    cdef int rc
+
+    if interval_length == 0.0:
+        h_out[0] = 0.0
+        return FNI_OK
+
+    for i in range(n):
+        scale[i] = s.atol[i] + fabs(y0[i]) * s.rtol[i]
+    d0 = _rms_norm_scaled(y0, scale, n)
+    d1 = _rms_norm_scaled(f0, scale, n)
+    if d0 < 1e-5 or d1 < 1e-5:
+        h0 = 1e-6
+    else:
+        h0 = 0.01 * d0 / d1
+    h0 = min(h0, interval_length)
+
+    for i in range(n):
+        y1[i] = y0[i] + h0 * s.direction * f0[i]
+    rc = _fun(s, s.t + h0 * s.direction, y1, f1)
+    if rc != FNI_OK:
+        return rc
+    for i in range(n):
+        diff[i] = f1[i] - f0[i]
+    d2 = _rms_norm_scaled(diff, scale, n) / h0
+
+    if d1 <= 1e-15 and d2 <= 1e-15:
+        h1 = max(1e-6, h0 * 1e-3)
+    else:
+        h1 = pow(0.01 / max(d1, d2), 1.0 / (s.tab.error_estimator_order + 1))
+
+    h_out[0] = min(100 * h0, h1, interval_length, s.max_step)
+    return FNI_OK
+
+
+cdef int fni_solver_init(fni_solver* s, int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
+                         double t0, const double* y0, double t_bound,
+                         const fni_options* opt) noexcept nogil:
+    """Set up a solver at (t0, y0); evaluates f(t0, y0) and the initial step.
+
+    Always call :func:`fni_solver_free` afterwards, even if this fails.
+    """
+    cdef const fni_tableau* tab = fni_get_tableau(method)
+    cdef Py_ssize_t i, total
+    cdef double r, a
+    s.mem = NULL
+    if tab == NULL or n < 0 or fun == NULL or not (opt.max_step > 0):
+        return FNI_ERR_ARG
+    total = (8 + tab.n_k_rows + tab.n_dense_coef) * n
+    s.mem = <double*> malloc((total if total > 0 else 1) * sizeof(double))
+    if s.mem == NULL:
+        return FNI_ERR_ALLOC
+    s.y = s.mem
+    s.y_old = s.y + n
+    s.f = s.y_old + n
+    s.y_new = s.f + n
+    s.y_stage = s.y_new + n
+    s.scale = s.y_stage + n
+    s.atol = s.scale + n
+    s.rtol = s.atol + n
+    s.K = s.rtol + n
+    s.dense = s.K + tab.n_k_rows * n
+
+    for i in range(n):
+        s.y[i] = y0[i]
+        r = opt.rtol_vec[i] if opt.rtol_vec != NULL else opt.rtol
+        if r < 100 * EPS:
+            r = 100 * EPS
+        s.rtol[i] = r
+        a = opt.atol_vec[i] if opt.atol_vec != NULL else opt.atol
+        if a < 0:
+            return FNI_ERR_ARG
+        s.atol[i] = a
+
+    s.tab = tab
+    s.fun = fun
+    s.ctx = ctx
+    s.n = n
+    s.t = t0
+    s.t_bound = t_bound
+    s.direction = 1.0 if t_bound >= t0 else -1.0
+    s.max_step = opt.max_step
+    s.t_old = NAN
+    s.has_t_old = False
+    s.dense_valid = False
+    s.error_exponent = -1.0 / (tab.error_estimator_order + 1)
+    s.h_previous = NAN
+    s.nfev = 0
+    s.n_accepted = 0
+    s.n_rejected = 0
+    s.status = FNI_RUNNING
+
+    if n == 0:
+        s.h_abs = INFINITY
+        return FNI_OK
+
+    cdef int rc = _fun(s, s.t, s.y, s.f)
+    if rc != FNI_OK:
+        return rc
+    if opt.first_step > 0:
+        if opt.first_step > fabs(t_bound - t0):
+            return FNI_ERR_ARG
+        s.h_abs = opt.first_step
+        return FNI_OK
+    return _select_initial_step(s, &s.h_abs)
+
+
+cdef void fni_solver_free(fni_solver* s) noexcept nogil:
+    if s.mem != NULL:
+        free(s.mem)
+    s.mem = NULL
+
+
+cdef int _rk_stages(fni_solver* s, double h) noexcept nogil:
+    """Fill K with all stages for step ``h``; write the solution into y_new.
+
+    Each stage argument is built with column sweeps ``acc += a_sj * K[j, :]``
+    over contiguous rows, skipping zero tableau entries (DOP853's A is
+    roughly half zeros).
+    """
+    cdef const fni_tableau* tab = s.tab
+    cdef Py_ssize_t st, j, i, n = s.n, ns = tab.n_stages
+    cdef double a
+    cdef double* y = s.y
+    cdef double* acc = s.y_stage
+    cdef double* y_new = s.y_new
+    cdef double* Kj
+    cdef int rc
+
+    memcpy(s.K, s.f, n * sizeof(double))
+
+    for st in range(1, ns):
+        for i in range(n):
+            acc[i] = 0.0
+        for j in range(st):
+            a = tab.A[st * tab.a_stride + j]
+            if a != 0.0:
+                Kj = s.K + j * n
+                for i in range(n):
+                    acc[i] += a * Kj[i]
+        for i in range(n):
+            acc[i] = y[i] + h * acc[i]
+        rc = _fun(s, s.t + tab.C[st] * h, acc, s.K + st * n)
+        if rc != FNI_OK:
+            return rc
+
+    for i in range(n):
+        acc[i] = 0.0
+    for j in range(ns):
+        a = tab.B[j]
+        if a != 0.0:
+            Kj = s.K + j * n
+            for i in range(n):
+                acc[i] += a * Kj[i]
+    for i in range(n):
+        y_new[i] = y[i] + h * acc[i]
+
+    # FSAL: the derivative at the new point is row n_stages of K.
+    return _fun(s, s.t + h, y_new, s.K + ns * n)
+
+
+cdef double _error_norm(const fni_solver* s, double h) noexcept nogil:
+    """Embedded error norm: RMS of ``h K^T E / scale`` (DOP853: blended 5th/3rd)."""
+    cdef const fni_tableau* tab = s.tab
+    cdef Py_ssize_t i, j, n = s.n, nk = tab.n_stages + 1
+    cdef double err, acc = 0.0
+    cdef double e5, e3, k, inv_scale
+    cdef double err5_norm_2 = 0.0, err3_norm_2 = 0.0, denom
+    if tab.E3 == NULL:
+        for i in range(n):
+            err = 0.0
+            for j in range(nk):
+                err += s.K[j * n + i] * tab.E[j]
+            err = h * err / s.scale[i]
+            acc += err * err
+        return sqrt(acc / n)
+    for i in range(n):
+        e5 = 0.0
+        e3 = 0.0
+        for j in range(nk):
+            k = s.K[j * n + i]
+            e5 += k * tab.E[j]
+            e3 += k * tab.E3[j]
+        inv_scale = 1.0 / s.scale[i]
+        e5 *= inv_scale
+        e3 *= inv_scale
+        err5_norm_2 += e5 * e5
+        err3_norm_2 += e3 * e3
+    if err5_norm_2 == 0.0 and err3_norm_2 == 0.0:
+        return 0.0
+    denom = err5_norm_2 + 0.01 * err3_norm_2
+    return fabs(h) * err5_norm_2 / sqrt(denom * n)
+
+
+cdef int _step_impl(fni_solver* s, bint* accepted) noexcept nogil:
+    """One accepted step with rejection/retry (scipy's RungeKutta._step_impl)."""
+    cdef Py_ssize_t i, n = s.n
+    cdef double t = s.t
+    cdef double min_step = 10 * fabs(nextafter(t, s.direction * INFINITY) - t)
+    cdef double h_abs, h, t_new, error_norm, factor, yi, yn
+    cdef bint step_rejected = False
+    cdef double* tmp
+    cdef int rc
+
+    accepted[0] = False
+    if s.h_abs > s.max_step:
+        h_abs = s.max_step
+    elif s.h_abs < min_step:
+        h_abs = min_step
+    else:
+        h_abs = s.h_abs
+
+    while True:
+        if h_abs < min_step:
+            return FNI_OK
+
+        h = h_abs * s.direction
+        t_new = t + h
+        if s.direction * (t_new - s.t_bound) > 0:
+            t_new = s.t_bound
+        h = t_new - t
+        h_abs = fabs(h)
+
+        rc = _rk_stages(s, h)
+        if rc != FNI_OK:
+            return rc
+
+        for i in range(n):
+            yi = fabs(s.y[i])
+            yn = fabs(s.y_new[i])
+            s.scale[i] = s.atol[i] + (yi if yi > yn else yn) * s.rtol[i]
+        error_norm = _error_norm(s, h)
+
+        if error_norm < 1:
+            if error_norm == 0:
+                factor = MAX_FACTOR
+            else:
+                factor = min(MAX_FACTOR, SAFETY * pow(error_norm, s.error_exponent))
+            if step_rejected:
+                factor = min(1.0, factor)
+            h_abs *= factor
+            break
+        else:
+            h_abs *= max(MIN_FACTOR, SAFETY * pow(error_norm, s.error_exponent))
+            step_rejected = True
+            s.n_rejected += 1
+
+    # Accept: keep y_old for dense output, swap y <-> y_new, take f from FSAL.
+    s.h_previous = h
+    memcpy(s.y_old, s.y, n * sizeof(double))
+    tmp = s.y
+    s.y = s.y_new
+    s.y_new = tmp
+    memcpy(s.f, s.K + s.tab.n_stages * n, n * sizeof(double))
+    s.t = t_new
+    s.h_abs = h_abs
+    s.n_accepted += 1
+    accepted[0] = True
+    return FNI_OK
+
+
+cdef int fni_solver_step(fni_solver* s) noexcept nogil:
+    """Advance one accepted step (scipy's OdeSolver.step). Updates ``s.status``."""
+    cdef double t = s.t
+    cdef bint accepted
+    cdef int rc
+    if s.status != FNI_RUNNING:
+        return FNI_ERR_ARG
+    s.dense_valid = False
+    if s.n == 0 or s.t == s.t_bound:
+        s.t_old = t
+        s.has_t_old = True
+        if s.n > 0:
+            memcpy(s.y_old, s.y, s.n * sizeof(double))
+        s.t = s.t_bound
+        s.status = FNI_FINISHED
+        return FNI_OK
+    rc = _step_impl(s, &accepted)
+    if rc != FNI_OK:
+        return rc
+    if not accepted:
+        s.status = FNI_FAILED
+    else:
+        s.t_old = t
+        s.has_t_old = True
+        if s.direction * (s.t - s.t_bound) >= 0:
+            s.status = FNI_FINISHED
+    return FNI_OK
+
+
+cdef int _build_dense(fni_solver* s) noexcept nogil:
+    cdef const fni_tableau* tab = s.tab
+    cdef Py_ssize_t k, j, i, st, r, n = s.n, nk = tab.n_stages + 1
+    cdef Py_ssize_t n_ext = tab.n_k_rows, ncoef = tab.n_dense_coef
+    cdef double p, a, d, dy, h, t_old
+    cdef double* row
+    cdef double* Kj
+    cdef double* acc
+    cdef double* f_old
+    cdef int rc
+
+    if tab.dense_kind == FNI_DENSE_RK:
+        # RK23/RK45: Q = K^T P, stored transposed as (n_coef, n).
+        for k in range(ncoef):
+            row = s.dense + k * n
+            for i in range(n):
+                row[i] = 0.0
+            for j in range(nk):
+                p = tab.P[j * ncoef + k]
+                if p != 0.0:
+                    Kj = s.K + j * n
+                    for i in range(n):
+                        row[i] += p * Kj[i]
+        return FNI_OK
+
+    # DOP853: extra stages 13-15, then F (7, n) exactly as scipy's _dense_output_impl.
+    h = s.h_previous
+    t_old = s.t_old
+    acc = s.y_stage
+    f_old = s.K
+    for st in range(tab.n_stages + 1, n_ext):
+        for i in range(n):
+            acc[i] = 0.0
+        for j in range(st):
+            a = tab.A[st * tab.a_stride + j]
+            if a != 0.0:
+                Kj = s.K + j * n
+                for i in range(n):
+                    acc[i] += a * Kj[i]
+        for i in range(n):
+            acc[i] = s.y_old[i] + acc[i] * h
+        rc = _fun(s, t_old + tab.C[st] * h, acc, s.K + st * n)
+        if rc != FNI_OK:
+            return rc
+
+    for i in range(n):
+        dy = s.y[i] - s.y_old[i]
+        s.dense[i] = dy
+        s.dense[n + i] = h * f_old[i] - dy
+        s.dense[2 * n + i] = 2 * dy - h * (s.f[i] + f_old[i])
+
+    for r in range(ncoef - 3):
+        row = s.dense + (3 + r) * n
+        for i in range(n):
+            row[i] = 0.0
+        for j in range(n_ext):
+            d = tab.D[r * n_ext + j]
+            if d != 0.0:
+                Kj = s.K + j * n
+                for i in range(n):
+                    row[i] += d * Kj[i]
+        for i in range(n):
+            row[i] *= h
+    return FNI_OK
+
+
+cdef int fni_solver_ensure_dense(fni_solver* s) noexcept nogil:
+    """Build the last step's interpolant once (DOP853 costs 3 RHS calls)."""
+    cdef int rc
+    if not s.dense_valid:
+        if s.n > 0 and s.t != s.t_old:
+            rc = _build_dense(s)
+            if rc != FNI_OK:
+                return rc
+        s.dense_valid = True
+    return FNI_OK
+
+
+cdef void fni_solver_dense_eval(const fni_solver* s, double t, double* out) noexcept nogil:
+    """Interpolate over the last step. Requires :func:`fni_solver_ensure_dense`."""
+    _interp_eval(s.tab.dense_kind, s.tab.n_dense_coef, s.n, s.t_old, s.t - s.t_old,
+                 s.y_old, s.dense, t, out)
+
+
+# --- events --------------------------------------------------------------------------
+
+cdef int fni_events_eval(const fni_event* events, Py_ssize_t n_events, double t,
+                         const double* y, Py_ssize_t n, double* g) noexcept nogil:
+    cdef Py_ssize_t e
+    for e in range(n_events):
+        if events[e].fn(t, y, n, events[e].ctx, &g[e]) != 0:
+            return FNI_ERR_CALLBACK
+    return FNI_OK
+
+
+cdef inline int _event_on_dense(const fni_solver* s, const fni_event* ev, double t,
+                                double* buf, double* g) noexcept nogil:
+    fni_solver_dense_eval(s, t, buf)
+    if ev.fn(t, buf, s.n, ev.ctx, g) != 0:
+        return FNI_ERR_CALLBACK
+    return FNI_OK
+
+
+cdef int _brentq_event(const fni_solver* s, const fni_event* ev, double xa, double xb,
+                       double* buf, double* root) noexcept nogil:
+    """Root of ``ev(t, sol(t))`` on [xa, xb]: scipy's C ``brentq`` with
+    ``xtol = rtol = 4 * EPS``, ``maxiter = 100``."""
+    cdef double xtol = 4 * EPS, rtol = 4 * EPS
+    cdef double xpre = xa, xcur = xb, xblk = 0.0
+    cdef double fpre, fcur, fblk = 0.0, spre = 0.0, scur = 0.0, sbis
+    cdef double delta, stry, dpre, dblk
+    cdef int i, rc
+
+    rc = _event_on_dense(s, ev, xpre, buf, &fpre)
+    if rc != FNI_OK:
+        return rc
+    rc = _event_on_dense(s, ev, xcur, buf, &fcur)
+    if rc != FNI_OK:
+        return rc
+    if fpre * fcur > 0:
+        return FNI_ERR_ROOT_SIGN
+    if fpre == 0:
+        root[0] = xpre
+        return FNI_OK
+    if fcur == 0:
+        root[0] = xcur
+        return FNI_OK
+
+    for i in range(BRENTQ_MAXITER):
+        if fpre != 0 and fcur != 0 and ((fpre < 0) != (fcur < 0)):
+            xblk = xpre
+            fblk = fpre
+            spre = scur = xcur - xpre
+        if fabs(fblk) < fabs(fcur):
+            xpre = xcur
+            xcur = xblk
+            xblk = xpre
+            fpre = fcur
+            fcur = fblk
+            fblk = fpre
+
+        delta = (xtol + rtol * fabs(xcur)) / 2
+        sbis = (xblk - xcur) / 2
+        if fcur == 0 or fabs(sbis) < delta:
+            root[0] = xcur
+            return FNI_OK
+
+        if fabs(spre) > delta and fabs(fcur) < fabs(fpre):
+            if xpre == xblk:
+                # interpolate
+                stry = -fcur * (xcur - xpre) / (fcur - fpre)
+            else:
+                # extrapolate
+                dpre = (fpre - fcur) / (xpre - xcur)
+                dblk = (fblk - fcur) / (xblk - xcur)
+                stry = -fcur * (fblk * dblk - fpre * dpre) / (dblk * dpre * (fblk - fpre))
+            if 2 * fabs(stry) < min(fabs(spre), 3 * fabs(sbis) - delta):
+                # good short step
+                spre = scur
+                scur = stry
+            else:
+                # bisect
+                spre = sbis
+                scur = sbis
+        else:
+            # bisect
+            spre = sbis
+            scur = sbis
+
+        xpre = xcur
+        fpre = fcur
+        if fabs(scur) > delta:
+            xcur += scur
+        else:
+            xcur += delta if sbis > 0 else -delta
+        rc = _event_on_dense(s, ev, xcur, buf, &fcur)
+        if rc != FNI_OK:
+            return rc
+
+    root[0] = xcur
+    return FNI_ERR_ROOT_CONV
+
+
+cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                          const double* g, double* g_new, double* counts,
+                          Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
+                          bint* terminate, double* buf) noexcept nogil:
+    """Detect and locate events in the step just taken (scipy's find_active_events
+    + handle_events).
+
+    ``g`` holds the event values at the start of the step. ``g_new`` receives the
+    values at the end (the caller then copies them into ``g``). ``counts`` is
+    the per-event occurrence count, updated here. On return, ``found[:n_found]``
+    and ``roots[:n_found]`` list the located events in scipy's order. If
+    ``terminate`` is set, the last of them is the terminal one. ``buf`` is
+    scratch of length ``n``.
+    """
+    cdef Py_ssize_t e, k, j, idx, cut, n_active = 0
+    cdef double tmp_r
+    cdef double t_old = s.t_old, t = s.t
+    cdef bint up, down, term = False
+    cdef int rc
+
+    n_found[0] = 0
+    terminate[0] = False
+    rc = fni_events_eval(events, n_events, s.t, s.y, s.n, g_new)
+    if rc != FNI_OK:
+        return rc
+    for e in range(n_events):
+        up = g[e] <= 0 and g_new[e] >= 0
+        down = g[e] >= 0 and g_new[e] <= 0
+        if ((up and events[e].direction > 0) or (down and events[e].direction < 0)
+                or ((up or down) and events[e].direction == 0)):
+            found[n_active] = e
+            n_active += 1
+    if n_active == 0:
+        return FNI_OK
+
+    rc = fni_solver_ensure_dense(s)
+    if rc != FNI_OK:
+        return rc
+    for k in range(n_active):
+        e = found[k]
+        counts[e] += 1
+        rc = _brentq_event(s, &events[e], t_old, t, buf, &roots[k])
+        if rc != FNI_OK:
+            return rc
+        if counts[e] >= events[e].max_events:
+            term = True
+
+    if term:
+        # Stable sort (found, roots) in the direction of integration, then keep
+        # events up to and including the first terminal one.
+        for k in range(1, n_active):
+            tmp_r = roots[k]
+            idx = found[k]
+            j = k - 1
+            while j >= 0 and ((roots[j] > tmp_r) if t > t_old else (roots[j] < tmp_r)):
+                roots[j + 1] = roots[j]
+                found[j + 1] = found[j]
+                j -= 1
+            roots[j + 1] = tmp_r
+            found[j + 1] = idx
+        cut = n_active
+        for k in range(n_active):
+            if counts[found[k]] >= events[found[k]].max_events:
+                cut = k + 1
+                break
+        n_active = cut
+
+    n_found[0] = n_active
+    terminate[0] = term
+    return FNI_OK
+
+
+cdef int fni_integrate(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
+                       double t0, const double* y0, double t1, const fni_options* opt,
+                       const fni_event* events, Py_ssize_t n_events,
+                       double* y_out, Py_ssize_t* record_event, double* record_t,
+                       double* record_y, Py_ssize_t max_records,
+                       fni_stats* stats) noexcept nogil:
+    """Integrate from (t0, y0) to t1 (or a terminal event) without the GIL.
+
+    Writes the final state to ``y_out`` (the state at the terminal event, if one
+    fired) and fills ``stats``. Located events are recorded into
+    ``record_event`` / ``record_t`` (and ``record_y``, ``max_records x n``
+    row-major, if not NULL) up to ``max_records``; ``stats.n_records`` counts
+    all of them. Same steps, events and results as :func:`solve_ivp`.
+    """
+    cdef fni_solver s
+    cdef Py_ssize_t k, e, n_found
+    cdef bint terminate
+    cdef double* work = NULL
+    cdef double* g
+    cdef double* g_new
+    cdef double* counts
+    cdef double* roots
+    cdef double* buf
+    cdef double* tmp
+    cdef Py_ssize_t* found = NULL
+    cdef int rc
+
+    stats.status = FNI_STATUS_FAILED
+    stats.t_final = t0
+    stats.nfev = 0
+    stats.n_accepted = 0
+    stats.n_rejected = 0
+    stats.n_records = 0
+
+    rc = fni_solver_init(&s, method, fun, ctx, n, t0, y0, t1, opt)
+    if rc != FNI_OK:
+        fni_solver_free(&s)
+        return rc
+
+    if n_events > 0:
+        work = <double*> malloc((4 * n_events + (n if n > 0 else 1)) * sizeof(double))
+        found = <Py_ssize_t*> malloc(n_events * sizeof(Py_ssize_t))
+        if work == NULL or found == NULL:
+            rc = FNI_ERR_ALLOC
+        else:
+            g = work
+            g_new = g + n_events
+            counts = g_new + n_events
+            roots = counts + n_events
+            buf = roots + n_events
+            for e in range(n_events):
+                counts[e] = 0.0
+            rc = fni_events_eval(events, n_events, t0, s.y, n, g)
+
+    while rc == FNI_OK:
+        rc = fni_solver_step(&s)
+        if rc != FNI_OK:
+            break
+        if s.status == FNI_FAILED:
+            stats.status = FNI_STATUS_FAILED
+            stats.t_final = s.t
+            memcpy(y_out, s.y, n * sizeof(double))
+            break
+
+        terminate = False
+        if n_events > 0:
+            rc = fni_events_check(&s, events, n_events, g, g_new, counts, found, roots,
+                                  &n_found, &terminate, buf)
+            if rc != FNI_OK:
+                break
+            for k in range(n_found):
+                if stats.n_records < max_records:
+                    record_event[stats.n_records] = found[k]
+                    record_t[stats.n_records] = roots[k]
+                    if record_y != NULL:
+                        fni_solver_dense_eval(&s, roots[k], record_y + stats.n_records * n)
+                stats.n_records += 1
+            tmp = g
+            g = g_new
+            g_new = tmp
+
+        if terminate:
+            stats.status = FNI_STATUS_EVENT
+            stats.t_final = roots[n_found - 1]
+            fni_solver_dense_eval(&s, stats.t_final, y_out)
+            break
+        if s.status == FNI_FINISHED:
+            stats.status = FNI_STATUS_FINISHED
+            stats.t_final = s.t
+            memcpy(y_out, s.y, n * sizeof(double))
+            break
+
+    stats.nfev = s.nfev
+    stats.n_accepted = s.n_accepted
+    stats.n_rejected = s.n_rejected
+    fni_solver_free(&s)
+    if work != NULL:
+        free(work)
+    if found != NULL:
+        free(found)
+    return rc
+
+
+# =============================================================================
+# Python <-> core glue
+# =============================================================================
+
+cdef int _check(int rc) except -1:
+    """Turn a core return code into a Python exception (or propagate one)."""
+    if rc == FNI_OK:
+        return 0
+    if PyErr_Occurred():
+        return -1          # an eval()/callable raised: propagate that exception
+    if rc == FNI_ERR_CALLBACK:
+        raise RuntimeError("a native right-hand side or event function returned an error code")
+    if rc == FNI_ERR_ALLOC:
+        raise MemoryError()
+    if rc == FNI_ERR_ROOT_SIGN:
+        raise ValueError("f(a) and f(b) must have different signs")
+    if rc == FNI_ERR_ROOT_CONV:
+        raise RuntimeError(f"Failed to converge after {BRENTQ_MAXITER} iterations.")
+    raise ValueError("invalid argument passed to the integration core")
+
+
+# Trampolines: let the GIL-free core call eval() overrides / Python callables.
+# They need the GIL, so they are only used when the caller holds it (the Python
+# path never releases it while one is installed). An exception raised inside
+# eval() stays set, the core unwinds with FNI_ERR_CALLBACK, and _check
+# re-raises it.
+
+cdef int _system_trampoline(double t, const double* y, double* dydt, Py_ssize_t n,
+                            void* ctx) except -1:
+    return (<OdeSystem> ctx).eval(t, y, dydt, n)
+
+
+cdef int _event_trampoline(double t, const double* y, Py_ssize_t n, void* ctx,
+                           double* g) except -1:
+    g[0] = (<EventFunction> ctx).eval(t, y, n)
+    return 0
+
+
+cdef inline fni_rhs_fn _rhs_of(OdeSystem system, void** ctx) noexcept:
+    if system.c_fn != NULL:
+        ctx[0] = system.c_ctx
+        return system.c_fn
+    ctx[0] = <void*> system
+    return <fni_rhs_fn> _system_trampoline
+
+
+cdef inline void _event_of(EventFunction ev, double max_events, fni_event* out) noexcept:
+    if ev.c_fn != NULL:
+        out.fn = ev.c_fn
+        out.ctx = ev.c_ctx
+    else:
+        out.fn = <fni_event_fn> _event_trampoline
+        out.ctx = <void*> ev
+    out.direction = ev.direction
+    out.max_events = max_events
+
+
 cdef inline Py_ssize_t _searchsorted(const double[::1] a, double v, bint left) noexcept:
     """``np.searchsorted(a, v, side='left'|'right')`` for ascending ``a``."""
     cdef Py_ssize_t lo = 0, hi = a.shape[0], mid
@@ -141,23 +949,95 @@ cdef inline Py_ssize_t _searchsorted(const double[::1] a, double v, bint left) n
     return lo
 
 
+cdef _init_param_buffer(obj_name, values, names):
+    arr = np.array([] if values is None else values, dtype=np.float64).reshape(-1)
+    k = arr.size
+    if names is None:
+        names = tuple(f"p{i}" for i in range(k))
+    else:
+        names = tuple(str(nm) for nm in names)
+        if len(names) != k:
+            raise ValueError(f"{obj_name}: {len(names)} parameter names for {k} parameters")
+    buf = np.zeros(max(k, 1))
+    buf[:k] = arr
+    return buf, k, names
+
+
+cdef _set_params(double[::1] buf, Py_ssize_t k, value, obj_name):
+    cdef Py_ssize_t i
+    arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    if arr.size != k:
+        raise ValueError(f"{obj_name} has {k} parameters, got {arr.size} values")
+    for i in range(k):
+        buf[i] = arr[i]      # in place: c_ctx pointers into the buffer stay valid
+
+
 # =============================================================================
 # Right-hand sides
 # =============================================================================
 
 cdef class OdeSystem:
-    """Base class for native right-hand sides ``dy/dt = f(t, y)``.
+    """Base class for native right-hand sides ``dy/dt = f(t, y; params)``.
 
-    Subclass in Cython and override the ``cdef`` method ``eval``. Instances are
-    also callable from Python as ``system(t, y) -> ndarray``, so the same object
-    works with :func:`scipy.integrate.solve_ivp` for comparisons.
+    Subclass in Cython. Either:
+
+    - set ``c_fn`` (a ``nogil`` C function, see ``fni_rhs_fn``) and ``c_ctx``
+      in ``__init__``. The engine then calls it directly, and the system also
+      works with the GIL-free C API; or
+    - override the ``cdef`` method ``eval`` (works everywhere except GIL-free
+      integration).
+
+    Runtime parameters: call ``self._init_params(values, names)`` in
+    ``__init__`` and read ``self._params[i]``, or point ``c_ctx`` at
+    ``self._params_ptr()``. Users change them between solves with
+    ``system.params = [...]`` without recompiling. Instances are also callable
+    from Python as ``system(t, y) -> ndarray``, so the same object works with
+    :func:`scipy.integrate.solve_ivp`.
     """
 
     def __cinit__(self, *args, **kwargs):
         self.n_states = -1
+        self.n_params = 0
+        self.param_names = ()
+        self._params = np.zeros(1)
+        self.c_fn = NULL
+        self.c_ctx = NULL
+
+    cdef int _init_params(self, values, names=None) except -1:
+        buf, k, nm = _init_param_buffer(type(self).__name__, values, names)
+        self._params = buf
+        self.n_params = k
+        self.param_names = nm
+        return 0
+
+    cdef double* _params_ptr(self) noexcept:
+        return &self._params[0]
+
+    @property
+    def params(self):
+        """Runtime parameters (copy). Assign to change them in place."""
+        return np.asarray(self._params)[:self.n_params].copy()
+
+    @params.setter
+    def params(self, value):
+        _set_params(self._params, self.n_params, value, type(self).__name__)
+
+    @property
+    def has_native_fn(self):
+        """True if a GIL-free C function is available (usable by :func:`integrate` without the GIL)."""
+        return self.c_fn != NULL
+
+    cdef int check_size(self, Py_ssize_t n) except -1:
+        if self.n_states >= 0 and n != self.n_states:
+            raise ValueError(f"system expects {self.n_states} states, y0 has {n}")
+        return 0
 
     cdef int eval(self, double t, const double* y, double* dydt, Py_ssize_t n) except -1:
-        raise NotImplementedError(f"{type(self).__name__} must implement eval()")
+        if self.c_fn == NULL:
+            raise NotImplementedError(f"{type(self).__name__} must implement eval() or set c_fn")
+        if self.c_fn(t, y, dydt, n, self.c_ctx) != 0:
+            raise RuntimeError(f"{type(self).__name__}: native RHS returned an error code")
+        return 0
 
     def __call__(self, double t, y):
         cdef const double[::1] y_view = np.ascontiguousarray(y, dtype=np.float64)
@@ -210,27 +1090,68 @@ cdef class PythonOdeSystem(OdeSystem):
         return 0
 
 
+
 # =============================================================================
 # Event functions
 # =============================================================================
 
 cdef class EventFunction:
-    """Base class for native event functions ``g(t, y)``.
+    """Base class for native event functions ``g(t, y; params)``.
 
-    Subclass in Cython and override ``eval``. ``terminal`` and ``direction``
-    behave like the attributes of scipy event callables.
+    Subclass in Cython and set ``c_fn``/``c_ctx`` (GIL-free) or override
+    ``eval``. Runtime ``params`` work as for :class:`OdeSystem`.
+    ``terminal`` and ``direction`` behave like the attributes of scipy event
+    callables.
     """
+
+    def __cinit__(self, *args, **kwargs):
+        self.n_params = 0
+        self.param_names = ()
+        self._params = np.zeros(1)
+        self.c_fn = NULL
+        self.c_ctx = NULL
 
     def __init__(self, terminal=False, double direction=0.0):
         self.terminal = terminal
         self.direction = direction
 
+    cdef int _init_params(self, values, names=None) except -1:
+        buf, k, nm = _init_param_buffer(type(self).__name__, values, names)
+        self._params = buf
+        self.n_params = k
+        self.param_names = nm
+        return 0
+
+    cdef double* _params_ptr(self) noexcept:
+        return &self._params[0]
+
+    @property
+    def params(self):
+        return np.asarray(self._params)[:self.n_params].copy()
+
+    @params.setter
+    def params(self, value):
+        _set_params(self._params, self.n_params, value, type(self).__name__)
+
+    @property
+    def has_native_fn(self):
+        return self.c_fn != NULL
+
+    cdef int check_size(self, Py_ssize_t n) except -1:
+        return 0
+
     cdef double eval(self, double t, const double* y, Py_ssize_t n) except? -1:
-        raise NotImplementedError(f"{type(self).__name__} must implement eval()")
+        cdef double g
+        if self.c_fn == NULL:
+            raise NotImplementedError(f"{type(self).__name__} must implement eval() or set c_fn")
+        if self.c_fn(t, y, n, self.c_ctx, &g) != 0:
+            raise RuntimeError(f"{type(self).__name__}: native event function returned an error code")
+        return g
 
     def __call__(self, double t, y):
         cdef const double[::1] y_view = np.ascontiguousarray(y, dtype=np.float64)
         cdef Py_ssize_t n = y_view.shape[0]
+        self.check_size(n)
         return self.eval(t, &y_view[0] if n > 0 else NULL, n)
 
 
@@ -255,28 +1176,52 @@ cdef class PythonEvent(EventFunction):
         return float(self.fun(t, _array_from(y, n), *self.args))
 
 
+
+cdef struct _crossing_ctx:
+    Py_ssize_t index
+    const double* value     # -> params[0]
+
+
+cdef int _component_crossing_fn(double t, const double* y, Py_ssize_t n, void* ctx,
+                                double* g) noexcept nogil:
+    cdef _crossing_ctx* c = <_crossing_ctx*> ctx
+    g[0] = y[c.index] - c.value[0]
+    return 0
+
+
 cdef class ComponentCrossing(EventFunction):
     """Native event ``g = y[index] - value``: a state component crosses a level.
 
-    Example: ``ComponentCrossing(2, 0.0, direction=-1)`` fires when ``z``
-    passes downward through zero.
+    ``value`` is runtime parameter 0 (``ev.params = [new_level]``). Example:
+    ``ComponentCrossing(2, 0.0, direction=-1)`` fires when ``z`` passes
+    downward through zero.
     """
 
-    cdef readonly Py_ssize_t index
-    cdef readonly double value
+    cdef _crossing_ctx data
 
     def __init__(self, Py_ssize_t index, double value=0.0, terminal=False,
                  double direction=0.0):
         super().__init__(terminal, direction)
         if index < 0:
             raise ValueError("index must be non-negative")
-        self.index = index
-        self.value = value
+        self._init_params([value], ("value",))
+        self.data.index = index
+        self.data.value = self._params_ptr()
+        self.c_fn = _component_crossing_fn
+        self.c_ctx = &self.data
 
-    cdef double eval(self, double t, const double* y, Py_ssize_t n) except? -1:
-        if self.index >= n:
-            raise IndexError(f"event index {self.index} out of range for state of size {n}")
-        return y[self.index] - self.value
+    @property
+    def index(self):
+        return self.data.index
+
+    @property
+    def value(self):
+        return self._params[0]
+
+    cdef int check_size(self, Py_ssize_t n) except -1:
+        if self.data.index >= n:
+            raise IndexError(f"event index {self.data.index} out of range for state of size {n}")
+        return 0
 
 
 # =============================================================================
@@ -422,6 +1367,7 @@ cdef class _RowBuffer:
         return self.r_arr[:self.count].copy()
 
 
+
 # =============================================================================
 # Integrators
 # =============================================================================
@@ -435,17 +1381,32 @@ def _warn_extraneous(extraneous):
         )
 
 
+
 cdef class RungeKutta:
     """Base class for explicit embedded Runge-Kutta methods with adaptive steps.
 
     Mirrors :class:`scipy.integrate.OdeSolver`: construct it with a problem,
     then call :meth:`step` until ``status != 'running'``. ``fun`` may be a
-    native :class:`OdeSystem` or a Python callable ``fun(t, y)``.
+    native :class:`OdeSystem` or a Python callable ``fun(t, y)``. All stepping
+    happens in the GIL-free core (``fni_solver``).
     """
+
+    def __cinit__(self, *args, **kwargs):
+        self.s.mem = NULL
+        self.method = -1
+
+    def __dealloc__(self):
+        fni_solver_free(&self.s)
 
     def __init__(self, fun, double t0, y0, double t_bound, double max_step=INFINITY,
                  rtol=1e-3, atol=1e-6, vectorized=False, first_step=None,
                  **extraneous):
+        cdef fni_options opt
+        cdef double[::1] y0_view, rtol_view, atol_view
+        cdef void* ctx
+        cdef fni_rhs_fn fn
+        cdef Py_ssize_t n
+
         _warn_extraneous(extraneous)
         self._init_tableau()
 
@@ -463,15 +1424,13 @@ cdef class RungeKutta:
             raise ValueError("`y0` must be 1-dimensional.")
         if not np.isfinite(y0_arr).all():
             raise ValueError("All components of the initial state `y0` must be finite.")
-        self.n = y0_arr.shape[0]
-        if system.n_states >= 0 and system.n_states != self.n:
-            raise ValueError(
-                f"system expects {system.n_states} states, y0 has {self.n}")
+        n = y0_arr.shape[0]
+        system.check_size(n)
 
         if max_step <= 0:
             raise ValueError("`max_step` must be positive.")
         rtol_arr = np.asarray(rtol, dtype=np.float64)
-        if rtol_arr.ndim > 0 and rtol_arr.shape != (self.n,):
+        if rtol_arr.ndim > 0 and rtol_arr.shape != (n,):
             raise ValueError("`rtol` has wrong shape.")
         if np.any(rtol_arr < 100 * EPS):
             warnings.warn(
@@ -481,54 +1440,37 @@ cdef class RungeKutta:
             )
             rtol_arr = np.maximum(rtol_arr, 100 * EPS)
         atol_arr = np.asarray(atol, dtype=np.float64)
-        if atol_arr.ndim > 0 and atol_arr.shape != (self.n,):
+        if atol_arr.ndim > 0 and atol_arr.shape != (n,):
             raise ValueError("`atol` has wrong shape.")
         if np.any(atol_arr < 0):
             raise ValueError("`atol` must be positive.")
-
-        self.system = system
-        self.t = t0
-        self.t_bound = t_bound
-        self.direction = 1.0 if t_bound >= t0 else -1.0
-        self.max_step = max_step
-        self._has_t_old = False
-        self._t_old = np.nan
-
-        # cnumpy-allocated working storage, viewed through typed memoryviews.
-        self._y = y0_arr
-        self._y_old = _empty1d(self.n)
-        self._f = _empty1d(self.n)
-        self._y_new = _empty1d(self.n)
-        self._y_stage = _empty1d(self.n)
-        self._scale = _empty1d(self.n)
-        self._atol = np.broadcast_to(atol_arr, (self.n,)).copy()
-        self._rtol = np.broadcast_to(rtol_arr, (self.n,)).copy()
-        self.K = _empty2d(self.n_k_rows, self.n)
-        self.dense_coef = _empty2d(self.n_dense_coef, self.n)
-        self.dense_valid = False
-
-        self.error_exponent = -1.0 / (self.error_estimator_order + 1)
-        self.h_previous = np.nan
-        self.nfev = 0
-        self.n_accepted = 0
-        self.n_rejected = 0
-        self.message = None
-        self._status = STATUS_RUNNING
-
-        if self.n == 0:
-            self.h_abs = INFINITY
-            return
-
-        self._fun(self.t, &self._y[0], &self._f[0])
-        if first_step is None:
-            self.h_abs = self._select_initial_step()
-        else:
+        if first_step is not None:
             first = float(first_step)
             if first <= 0:
                 raise ValueError("`first_step` must be positive.")
             if first > fabs(t_bound - t0):
                 raise ValueError("`first_step` exceeds bounds.")
-            self.h_abs = first
+        else:
+            first = -1.0
+
+        rtol_b = np.array(np.broadcast_to(rtol_arr, (max(n, 1),)), dtype=np.float64)
+        atol_b = np.array(np.broadcast_to(atol_arr, (max(n, 1),)), dtype=np.float64)
+        y0_b = y0_arr if n > 0 else np.zeros(1)
+        y0_view = y0_b
+        rtol_view = rtol_b
+        atol_view = atol_b
+        opt.rtol = 0.0
+        opt.rtol_vec = &rtol_view[0]
+        opt.atol = 0.0
+        opt.atol_vec = &atol_view[0]
+        opt.first_step = first
+        opt.max_step = max_step
+
+        self.system = system
+        self.message = None
+        fn = _rhs_of(system, &ctx)
+        fni_solver_free(&self.s)
+        _check(fni_solver_init(&self.s, self.method, fn, ctx, n, t0, &y0_view[0], t_bound, &opt))
 
     def _init_tableau(self):
         raise NotImplementedError("use RK23, RK45 or DOP853")
@@ -536,23 +1478,67 @@ cdef class RungeKutta:
     # --- public Python API (mirrors scipy.integrate.OdeSolver) ----------------
 
     @property
+    def n(self):
+        return self.s.n
+
+    @property
+    def t(self):
+        return self.s.t
+
+    @property
+    def t_bound(self):
+        return self.s.t_bound
+
+    @property
+    def direction(self):
+        return self.s.direction
+
+    @property
+    def h_abs(self):
+        return self.s.h_abs
+
+    @property
+    def nfev(self):
+        return self.s.nfev
+
+    @property
+    def n_accepted(self):
+        return self.s.n_accepted
+
+    @property
+    def n_rejected(self):
+        return self.s.n_rejected
+
+    @property
+    def n_stages(self):
+        return self.s.tab.n_stages
+
+    @property
+    def order(self):
+        return self.s.tab.order
+
+    @property
+    def error_estimator_order(self):
+        return self.s.tab.error_estimator_order
+
+    @property
     def status(self):
-        return _STATUS_NAMES[self._status]
+        return _STATUS_NAMES[self.s.status]
 
     @property
     def y(self):
         """Copy of the current state."""
-        return np.asarray(self._y).copy()
+        return _array_from(self.s.y, self.s.n)
 
     @property
     def t_old(self):
         """Time at the start of the last step, or None before the first step."""
-        return self._t_old if self._has_t_old else None
+        return self.s.t_old if self.s.has_t_old else None
 
     @property
     def step_size(self):
         """Size of the last successful step, or None before the first step."""
-        return fabs(self.t - self._t_old) if self._has_t_old else None
+        return fabs(self.s.t - self.s.t_old) if self.s.has_t_old else None
 
     @property
     def njev(self):
@@ -564,270 +1550,48 @@ cdef class RungeKutta:
 
     def step(self):
         """Advance one accepted step. Returns the failure message, or None."""
-        if self._status != STATUS_RUNNING:
+        if self.s.status != FNI_RUNNING:
             raise RuntimeError("Attempt to step on a failed or finished solver.")
         self._step()
         return self.message
 
     def dense_output(self):
         """Interpolant over the last successful step, as a one-segment :class:`OdeSolution`."""
-        if not self._has_t_old:
+        if not self.s.has_t_old:
             raise RuntimeError("Dense output is available after a successful "
                                "step was made.")
         self._ensure_dense()
+        cdef Py_ssize_t n = self.s.n, ncoef = self.s.tab.n_dense_coef
         row = np.concatenate((
-            [self._t_old, self.t - self._t_old],
-            np.asarray(self._y_old),
-            np.asarray(self.dense_coef).reshape(-1),
+            [self.s.t_old, self.s.t - self.s.t_old],
+            _array_from(self.s.y_old, n),
+            _array_from(self.s.dense, ncoef * n),
         ))
-        return OdeSolution([self._t_old, self.t], row[None, :], self.dense_kind,
-                           self.n, self.n_dense_coef)
-
-    # --- C-level core --------------------------------------------------------
-
-    cdef int _fun(self, double t, const double* y, double* dydt) except -1:
-        self.nfev += 1
-        return self.system.eval(t, y, dydt, self.n)
-
-    cdef double _select_initial_step(self) except -1.0:
-        """Hairer-Norsett-Wanner initial step heuristic (scipy's select_initial_step)."""
-        cdef Py_ssize_t i, n = self.n
-        cdef double interval_length = fabs(self.t_bound - self.t)
-        cdef double d0, d1, d2, h0, h1
-        cdef double* y0 = &self._y[0]
-        cdef double* f0 = &self._f[0]
-        cdef double* scale = &self._scale[0]
-        cdef double* y1 = &self._y_new[0]
-        cdef double* f1 = &self.K[0, 0]    # free scratch before the first step
-        cdef double* diff = &self._y_stage[0]
-
-        if interval_length == 0.0:
-            return 0.0
-
-        for i in range(n):
-            scale[i] = self._atol[i] + fabs(y0[i]) * self._rtol[i]
-        d0 = _rms_norm_scaled(y0, scale, n)
-        d1 = _rms_norm_scaled(f0, scale, n)
-        if d0 < 1e-5 or d1 < 1e-5:
-            h0 = 1e-6
-        else:
-            h0 = 0.01 * d0 / d1
-        h0 = min(h0, interval_length)
-
-        for i in range(n):
-            y1[i] = y0[i] + h0 * self.direction * f0[i]
-        self._fun(self.t + h0 * self.direction, y1, f1)
-        for i in range(n):
-            diff[i] = f1[i] - f0[i]
-        d2 = _rms_norm_scaled(diff, scale, n) / h0
-
-        if d1 <= 1e-15 and d2 <= 1e-15:
-            h1 = max(1e-6, h0 * 1e-3)
-        else:
-            h1 = pow(0.01 / max(d1, d2), 1.0 / (self.error_estimator_order + 1))
-
-        return min(100 * h0, h1, interval_length, self.max_step)
-
-    cdef int _rk_stages(self, double h) except -1:
-        """Fill K with all stages for step ``h``; write the solution into y_new.
-
-        Each stage argument is built with column sweeps ``acc += a_sj * K[j, :]``
-        over contiguous rows, skipping zero tableau entries (DOP853's A is
-        roughly half zeros).
-        """
-        cdef Py_ssize_t s, j, i, n = self.n, ns = self.n_stages
-        cdef double a
-        cdef double* y = &self._y[0]
-        cdef double* acc = &self._y_stage[0]
-        cdef double* y_new = &self._y_new[0]
-        cdef double* Kj
-
-        memcpy(&self.K[0, 0], &self._f[0], n * sizeof(double))
-
-        for s in range(1, ns):
-            for i in range(n):
-                acc[i] = 0.0
-            for j in range(s):
-                a = self.A[s, j]
-                if a != 0.0:
-                    Kj = &self.K[j, 0]
-                    for i in range(n):
-                        acc[i] += a * Kj[i]
-            for i in range(n):
-                acc[i] = y[i] + h * acc[i]
-            self._fun(self.t + self.C[s] * h, acc, &self.K[s, 0])
-
-        for i in range(n):
-            acc[i] = 0.0
-        for j in range(ns):
-            a = self.B[j]
-            if a != 0.0:
-                Kj = &self.K[j, 0]
-                for i in range(n):
-                    acc[i] += a * Kj[i]
-        for i in range(n):
-            y_new[i] = y[i] + h * acc[i]
-
-        # FSAL: the derivative at the new point is row n_stages of K.
-        self._fun(self.t + h, y_new, &self.K[ns, 0])
-        return 0
-
-    cdef double _error_norm(self, double h):
-        """RMS norm of the embedded error estimate ``h * K^T E`` scaled by ``scale``."""
-        cdef Py_ssize_t i, j, n = self.n, nk = self.n_stages + 1
-        cdef double err, acc = 0.0
-        for i in range(n):
-            err = 0.0
-            for j in range(nk):
-                err += self.K[j, i] * self.E[j]
-            err = h * err / self._scale[i]
-            acc += err * err
-        return sqrt(acc / n)
-
-    cdef int _step_impl(self) except -1:
-        """One accepted step with rejection/retry. 1 = ok, 0 = step too small."""
-        cdef Py_ssize_t i, n = self.n
-        cdef double t = self.t
-        cdef double min_step = 10 * fabs(nextafter(t, self.direction * INFINITY) - t)
-        cdef double h_abs, h, t_new, error_norm, factor, yi, yn
-        cdef bint step_rejected = False
-
-        if self.h_abs > self.max_step:
-            h_abs = self.max_step
-        elif self.h_abs < min_step:
-            h_abs = min_step
-        else:
-            h_abs = self.h_abs
-
-        while True:
-            if h_abs < min_step:
-                return 0
-
-            h = h_abs * self.direction
-            t_new = t + h
-            if self.direction * (t_new - self.t_bound) > 0:
-                t_new = self.t_bound
-            h = t_new - t
-            h_abs = fabs(h)
-
-            self._rk_stages(h)
-
-            for i in range(n):
-                yi = fabs(self._y[i])
-                yn = fabs(self._y_new[i])
-                self._scale[i] = self._atol[i] + (yi if yi > yn else yn) * self._rtol[i]
-            error_norm = self._error_norm(h)
-
-            if error_norm < 1:
-                if error_norm == 0:
-                    factor = MAX_FACTOR
-                else:
-                    factor = min(MAX_FACTOR, SAFETY * pow(error_norm, self.error_exponent))
-                if step_rejected:
-                    factor = min(1.0, factor)
-                h_abs *= factor
-                break
-            else:
-                h_abs *= max(MIN_FACTOR, SAFETY * pow(error_norm, self.error_exponent))
-                step_rejected = True
-                self.n_rejected += 1
-
-        # Accept: keep y_old for dense output, swap y <-> y_new, take f from FSAL.
-        self.h_previous = h
-        memcpy(&self._y_old[0], &self._y[0], n * sizeof(double))
-        self._y, self._y_new = self._y_new, self._y
-        memcpy(&self._f[0], &self.K[self.n_stages, 0], n * sizeof(double))
-        self.t = t_new
-        self.h_abs = h_abs
-        self.n_accepted += 1
-        return 1
+        return OdeSolution([self.s.t_old, self.s.t], row[None, :], self.s.tab.dense_kind,
+                           n, ncoef)
 
     cdef int _step(self) except -1:
-        """scipy's OdeSolver.step(): handles the trivial cases and status updates."""
-        cdef double t = self.t
-        self.dense_valid = False
-        if self.n == 0 or self.t == self.t_bound:
-            self._t_old = t
-            self._has_t_old = True
-            if self.n > 0:
-                memcpy(&self._y_old[0], &self._y[0], self.n * sizeof(double))
-            self.t = self.t_bound
-            self._status = STATUS_FINISHED
-            return 0
-        if not self._step_impl():
-            self._status = STATUS_FAILED
+        _check(fni_solver_step(&self.s))
+        if self.s.status == FNI_FAILED:
             self.message = MSG_TOO_SMALL_STEP
-        else:
-            self._t_old = t
-            self._has_t_old = True
-            if self.direction * (self.t - self.t_bound) >= 0:
-                self._status = STATUS_FINISHED
-        return 0
-
-    cdef int _build_dense(self) except -1:
-        """RK23/RK45: Q = K^T P, stored transposed as (n_coef, n)."""
-        cdef Py_ssize_t k, j, i, n = self.n, nk = self.n_stages + 1
-        cdef double p
-        cdef double* row
-        cdef double* Kj
-        for k in range(self.n_dense_coef):
-            row = &self.dense_coef[k, 0]
-            for i in range(n):
-                row[i] = 0.0
-            for j in range(nk):
-                p = self.P[j, k]
-                if p != 0.0:
-                    Kj = &self.K[j, 0]
-                    for i in range(n):
-                        row[i] += p * Kj[i]
         return 0
 
     cdef int _ensure_dense(self) except -1:
-        """Build the last step's interpolant once (DOP853 costs 3 RHS calls)."""
-        if not self.dense_valid:
-            if self.n > 0 and self.t != self._t_old:
-                self._build_dense()
-            self.dense_valid = True
-        return 0
-
-    cdef void _dense_eval(self, double t, double* out) noexcept:
-        _interp_eval(self.dense_kind, self.n_dense_coef, self.n, self._t_old,
-                     self.t - self._t_old, &self._y_old[0], &self.dense_coef[0, 0],
-                     t, out)
+        return _check(fni_solver_ensure_dense(&self.s))
 
 
 cdef class RK23(RungeKutta):
     """Bogacki-Shampine 3(2) pair (``scipy.integrate.RK23``)."""
 
     def _init_tableau(self):
-        self.order = tableaus.RK23_ORDER
-        self.error_estimator_order = tableaus.RK23_ERROR_ESTIMATOR_ORDER
-        self.n_stages = tableaus.RK23_N_STAGES
-        self.n_k_rows = self.n_stages + 1
-        self.A = np.ascontiguousarray(tableaus.RK23_A, dtype=np.float64)
-        self.B = np.ascontiguousarray(tableaus.RK23_B, dtype=np.float64)
-        self.C = np.ascontiguousarray(tableaus.RK23_C, dtype=np.float64)
-        self.E = np.ascontiguousarray(tableaus.RK23_E, dtype=np.float64)
-        self.P = np.ascontiguousarray(tableaus.RK23_P, dtype=np.float64)
-        self.dense_kind = DENSE_RK
-        self.n_dense_coef = self.P.shape[1]
+        self.method = FNI_RK23
 
 
 cdef class RK45(RungeKutta):
     """Dormand-Prince 5(4) pair (``scipy.integrate.RK45``)."""
 
     def _init_tableau(self):
-        self.order = tableaus.RK45_ORDER
-        self.error_estimator_order = tableaus.RK45_ERROR_ESTIMATOR_ORDER
-        self.n_stages = tableaus.RK45_N_STAGES
-        self.n_k_rows = self.n_stages + 1
-        self.A = np.ascontiguousarray(tableaus.RK45_A, dtype=np.float64)
-        self.B = np.ascontiguousarray(tableaus.RK45_B, dtype=np.float64)
-        self.C = np.ascontiguousarray(tableaus.RK45_C, dtype=np.float64)
-        self.E = np.ascontiguousarray(tableaus.RK45_E, dtype=np.float64)
-        self.P = np.ascontiguousarray(tableaus.RK45_P, dtype=np.float64)
-        self.dense_kind = DENSE_RK
-        self.n_dense_coef = self.P.shape[1]
+        self.method = FNI_RK45
 
 
 cdef class DOP853(RungeKutta):
@@ -837,183 +1601,16 @@ cdef class DOP853(RungeKutta):
     three extra stages of the 7th-order continuous extension on demand.
     """
 
-    cdef const double[::1] E3
-    cdef const double[::1] E5
-    cdef const double[:, ::1] A_ext   # full 16x16 tableau (extra stages included)
-    cdef const double[::1] C_ext
-    cdef const double[:, ::1] D
-
     def _init_tableau(self):
-        cdef Py_ssize_t ns = tableaus.DOP853_N_STAGES
-        self.order = tableaus.DOP853_ORDER
-        self.error_estimator_order = tableaus.DOP853_ERROR_ESTIMATOR_ORDER
-        self.n_stages = ns
-        self.n_k_rows = tableaus.DOP853_N_STAGES_EXTENDED
-        self.A = np.ascontiguousarray(tableaus.DOP853_A[:ns, :ns], dtype=np.float64)
-        self.B = np.ascontiguousarray(tableaus.DOP853_B, dtype=np.float64)
-        self.C = np.ascontiguousarray(tableaus.DOP853_C[:ns], dtype=np.float64)
-        self.E5 = np.ascontiguousarray(tableaus.DOP853_E5, dtype=np.float64)
-        self.E = self.E5
-        self.E3 = np.ascontiguousarray(tableaus.DOP853_E3, dtype=np.float64)
-        self.A_ext = np.ascontiguousarray(tableaus.DOP853_A, dtype=np.float64)
-        self.C_ext = np.ascontiguousarray(tableaus.DOP853_C, dtype=np.float64)
-        self.D = np.ascontiguousarray(tableaus.DOP853_D, dtype=np.float64)
-        self.dense_kind = DENSE_DOP853
-        self.n_dense_coef = tableaus.DOP853_INTERPOLATOR_POWER
-
-    cdef double _error_norm(self, double h):
-        cdef Py_ssize_t i, j, n = self.n, nk = self.n_stages + 1
-        cdef double e5, e3, k, inv_scale
-        cdef double err5_norm_2 = 0.0, err3_norm_2 = 0.0, denom
-        for i in range(n):
-            e5 = 0.0
-            e3 = 0.0
-            for j in range(nk):
-                k = self.K[j, i]
-                e5 += k * self.E5[j]
-                e3 += k * self.E3[j]
-            inv_scale = 1.0 / self._scale[i]
-            e5 *= inv_scale
-            e3 *= inv_scale
-            err5_norm_2 += e5 * e5
-            err3_norm_2 += e3 * e3
-        if err5_norm_2 == 0.0 and err3_norm_2 == 0.0:
-            return 0.0
-        denom = err5_norm_2 + 0.01 * err3_norm_2
-        return fabs(h) * err5_norm_2 / sqrt(denom * n)
-
-    cdef int _build_dense(self) except -1:
-        """Extra stages 13-15, then F (7, n) exactly as scipy's _dense_output_impl."""
-        cdef Py_ssize_t s, j, i, r, n = self.n
-        cdef Py_ssize_t n_ext = self.n_k_rows
-        cdef double a, d, dy
-        cdef double h = self.h_previous
-        cdef double t_old = self._t_old
-        cdef double* y_old = &self._y_old[0]
-        cdef double* y = &self._y[0]
-        cdef double* f = &self._f[0]
-        cdef double* f_old = &self.K[0, 0]
-        cdef double* acc = &self._y_stage[0]
-        cdef double* row
-        cdef double* Kj
-
-        for s in range(self.n_stages + 1, n_ext):
-            for i in range(n):
-                acc[i] = 0.0
-            for j in range(s):
-                a = self.A_ext[s, j]
-                if a != 0.0:
-                    Kj = &self.K[j, 0]
-                    for i in range(n):
-                        acc[i] += a * Kj[i]
-            for i in range(n):
-                acc[i] = y_old[i] + acc[i] * h
-            self._fun(t_old + self.C_ext[s] * h, acc, &self.K[s, 0])
-
-        for i in range(n):
-            dy = y[i] - y_old[i]
-            self.dense_coef[0, i] = dy
-            self.dense_coef[1, i] = h * f_old[i] - dy
-            self.dense_coef[2, i] = 2 * dy - h * (f[i] + f_old[i])
-
-        for r in range(self.n_dense_coef - 3):
-            row = &self.dense_coef[3 + r, 0]
-            for i in range(n):
-                row[i] = 0.0
-            for j in range(n_ext):
-                d = self.D[r, j]
-                if d != 0.0:
-                    Kj = &self.K[j, 0]
-                    for i in range(n):
-                        row[i] += d * Kj[i]
-            for i in range(n):
-                row[i] *= h
-        return 0
+        self.method = FNI_DOP853
 
 
 METHODS = {"RK23": RK23, "RK45": RK45, "DOP853": DOP853}
 
 
 # =============================================================================
-# Event handling
+# Event preparation
 # =============================================================================
-
-cdef double _event_on_dense(RungeKutta solver, EventFunction ev, double t,
-                            double* buf) except? -1:
-    solver._dense_eval(t, buf)
-    return ev.eval(t, buf, solver.n)
-
-
-cdef double _brentq_event(RungeKutta solver, EventFunction ev, double xa,
-                          double xb, double* buf) except? -1:
-    """Root of ``ev(t, sol(t))`` on [xa, xb]: scipy's C ``brentq`` with
-    ``xtol = rtol = 4 * EPS``, ``maxiter = 100``."""
-    cdef double xtol = 4 * EPS, rtol = 4 * EPS
-    cdef double xpre = xa, xcur = xb, xblk = 0.0
-    cdef double fpre, fcur, fblk = 0.0, spre = 0.0, scur = 0.0, sbis
-    cdef double delta, stry, dpre, dblk
-    cdef int i
-
-    fpre = _event_on_dense(solver, ev, xpre, buf)
-    fcur = _event_on_dense(solver, ev, xcur, buf)
-    if fpre * fcur > 0:
-        raise ValueError("f(a) and f(b) must have different signs")
-    if fpre == 0:
-        return xpre
-    if fcur == 0:
-        return xcur
-
-    for i in range(BRENTQ_MAXITER):
-        if fpre != 0 and fcur != 0 and ((fpre < 0) != (fcur < 0)):
-            xblk = xpre
-            fblk = fpre
-            spre = scur = xcur - xpre
-        if fabs(fblk) < fabs(fcur):
-            xpre = xcur
-            xcur = xblk
-            xblk = xpre
-            fpre = fcur
-            fcur = fblk
-            fblk = fpre
-
-        delta = (xtol + rtol * fabs(xcur)) / 2
-        sbis = (xblk - xcur) / 2
-        if fcur == 0 or fabs(sbis) < delta:
-            return xcur
-
-        if fabs(spre) > delta and fabs(fcur) < fabs(fpre):
-            if xpre == xblk:
-                # interpolate
-                stry = -fcur * (xcur - xpre) / (fcur - fpre)
-            else:
-                # extrapolate
-                dpre = (fpre - fcur) / (xpre - xcur)
-                dblk = (fblk - fcur) / (xblk - xcur)
-                stry = -fcur * (fblk * dblk - fpre * dpre) / (dblk * dpre * (fblk - fpre))
-            if 2 * fabs(stry) < min(fabs(spre), 3 * fabs(sbis) - delta):
-                # good short step
-                spre = scur
-                scur = stry
-            else:
-                # bisect
-                spre = sbis
-                scur = sbis
-        else:
-            # bisect
-            spre = sbis
-            scur = sbis
-
-        xpre = xcur
-        fpre = fcur
-        if fabs(scur) > delta:
-            xcur += scur
-        else:
-            xcur += delta if sbis > 0 else -delta
-        fcur = _event_on_dense(solver, ev, xcur, buf)
-
-    raise RuntimeError(
-        f"Failed to converge after {BRENTQ_MAXITER} iterations, value is {xcur}.")
-
 
 def _prepare_events(events, args):
     """Normalise ``events`` to EventFunction objects (scipy's prepare_events)."""
@@ -1043,6 +1640,36 @@ def _prepare_events(events, args):
     return out, max_events, direction
 
 
+
+cdef class _EventArray:
+    """Owns a C array of fni_event built from EventFunction objects (kept alive)."""
+
+    cdef fni_event* ev
+    cdef Py_ssize_t n
+    cdef list objs
+    cdef bint all_native
+
+    def __cinit__(self, list events, max_events, Py_ssize_t n_states):
+        cdef Py_ssize_t e
+        cdef EventFunction obj
+        self.n = len(events)
+        self.objs = events
+        self.all_native = True
+        self.ev = <fni_event*> malloc((self.n if self.n > 0 else 1) * sizeof(fni_event))
+        if self.ev == NULL:
+            raise MemoryError()
+        for e in range(self.n):
+            obj = <EventFunction> events[e]
+            obj.check_size(n_states)
+            _event_of(obj, max_events[e], &self.ev[e])
+            if obj.c_fn == NULL:
+                self.all_native = False
+
+    def __dealloc__(self):
+        if self.ev != NULL:
+            free(self.ev)
+
+
 # =============================================================================
 # Driver
 # =============================================================================
@@ -1067,26 +1694,26 @@ class OdeResult(dict):
 
     def __repr__(self):
         return (f"OdeResult(success={self.success}, status={self.status}, "
-                f"nfev={self.nfev}, n_points={self.t.shape[0]}, "
+                f"nfev={self.nfev}, n_points={np.size(self.t)}, "
                 f"message={self.message!r})")
 
 
+
 cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
-                   Py_ssize_t t_eval_i, bint dense_output, list events,
-                   double[::1] max_events, double[::1] event_dir):
-    """The solve_ivp main loop (same control flow as scipy's)."""
-    cdef Py_ssize_t n = solver.n
-    cdef Py_ssize_t ncoef = solver.n_dense_coef
-    cdef Py_ssize_t n_events = len(events)
+                   Py_ssize_t t_eval_i, bint dense_output, _EventArray events):
+    """The solve_ivp main loop (same control flow as scipy's), on the C core."""
+    cdef fni_solver* s = &solver.s
+    cdef Py_ssize_t n = s.n
+    cdef Py_ssize_t ncoef = s.tab.n_dense_coef
+    cdef Py_ssize_t n_events = events.n
     cdef bint has_t_eval = t_eval_obj is not None
     cdef const double[::1] t_eval
-    cdef Py_ssize_t t_eval_i_new, j, k, e, n_active, idx, cut
+    cdef Py_ssize_t t_eval_i_new, j, k, e, idx, n_found
     cdef int status = 2   # 2 = still running
-    cdef double t_old, t, root, tmp_r
-    cdef double* y_ptr
+    cdef double t_old, t, root
+    cdef const double* y_ptr
     cdef double* seg_row
     cdef bint terminate
-    cdef EventFunction ev
 
     if has_t_eval:
         t_eval = t_eval_obj
@@ -1096,36 +1723,34 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
     cdef _RowBuffer bounds = _RowBuffer(0) if (dense_output and has_t_eval) else None
     cdef double[::1] buf = _empty1d(max(n, 1))       # interpolation scratch
     cdef double[::1] y_term = _empty1d(max(n, 1))    # state at a terminal event
-    cdef double[::1] y0_copy = _array_from(&solver._y[0], n) if n > 0 else _empty1d(1)
 
     if not has_t_eval:
-        traj.push_row(t0, &solver._y[0])
+        traj.push_row(t0, s.y)
     if bounds is not None:
         bounds.push(t0)
 
     # Event bookkeeping.
-    cdef double[::1] g = _empty1d(n_events)
-    cdef double[::1] g_new = _empty1d(n_events)
-    cdef double[::1] event_count = np.zeros(n_events)
-    cdef double[::1] roots = _empty1d(n_events)
-    cdef Py_ssize_t[::1] active = np.empty(n_events, dtype=np.intp)
+    cdef double[::1] g = _empty1d(max(n_events, 1))
+    cdef double[::1] g_new = _empty1d(max(n_events, 1))
+    cdef double[::1] counts = np.zeros(max(n_events, 1))
+    cdef double[::1] roots = _empty1d(max(n_events, 1))
+    cdef Py_ssize_t[::1] found = np.empty(max(n_events, 1), dtype=np.intp)
     t_events = [[] for _ in range(n_events)]
     y_events = [[] for _ in range(n_events)]
-    for e in range(n_events):
-        ev = <EventFunction> events[e]
-        g[e] = ev.eval(t0, &y0_copy[0], n)
+    if n_events > 0:
+        _check(fni_events_eval(events.ev, n_events, t0, s.y, n, &g[0]))
 
     while status == 2:
         solver._step()
-        if solver._status == STATUS_FINISHED:
+        if s.status == FNI_FINISHED:
             status = 0
-        elif solver._status == STATUS_FAILED:
+        elif s.status == FNI_FAILED:
             status = -1
             break
 
-        t_old = solver._t_old
-        t = solver.t
-        y_ptr = &solver._y[0]
+        t_old = s.t_old
+        t = s.t
+        y_ptr = s.y
 
         if dense_output:
             solver._ensure_dense()
@@ -1134,66 +1759,23 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
             seg_row[0] = t_old
             seg_row[1] = t - t_old
             if n > 0:
-                memcpy(seg_row + 2, &solver._y_old[0], n * sizeof(double))
-                memcpy(seg_row + 2 + n, &solver.dense_coef[0, 0], ncoef * n * sizeof(double))
+                memcpy(seg_row + 2, s.y_old, n * sizeof(double))
+                memcpy(seg_row + 2 + n, s.dense, ncoef * n * sizeof(double))
 
         if n_events > 0:
-            n_active = 0
-            for e in range(n_events):
-                ev = <EventFunction> events[e]
-                g_new[e] = ev.eval(t, y_ptr, n)
-                # find_active_events
-                if ((g[e] <= 0 and g_new[e] >= 0 and event_dir[e] > 0) or
-                        (g[e] >= 0 and g_new[e] <= 0 and event_dir[e] < 0) or
-                        (((g[e] <= 0 and g_new[e] >= 0) or (g[e] >= 0 and g_new[e] <= 0))
-                         and event_dir[e] == 0)):
-                    active[n_active] = e
-                    n_active += 1
-
-            if n_active > 0:
-                solver._ensure_dense()
-                terminate = False
-                for k in range(n_active):
-                    e = active[k]
-                    event_count[e] += 1
-                    roots[k] = _brentq_event(solver, <EventFunction> events[e],
-                                             t_old, t, &buf[0])
-                    if event_count[e] >= max_events[e]:
-                        terminate = True
-
-                if terminate:
-                    # Stable sort (active, roots) in the direction of integration,
-                    # then keep events up to and including the first terminal one.
-                    for k in range(1, n_active):
-                        tmp_r = roots[k]
-                        idx = active[k]
-                        j = k - 1
-                        while j >= 0 and ((roots[j] > tmp_r) if t > t_old else (roots[j] < tmp_r)):
-                            roots[j + 1] = roots[j]
-                            active[j + 1] = active[j]
-                            j -= 1
-                        roots[j + 1] = tmp_r
-                        active[j + 1] = idx
-                    cut = n_active
-                    for k in range(n_active):
-                        if event_count[active[k]] >= max_events[active[k]]:
-                            cut = k + 1
-                            break
-                    n_active = cut
-
-                for k in range(n_active):
-                    e = active[k]
-                    root = roots[k]
-                    t_events[e].append(root)
-                    solver._dense_eval(root, &buf[0])
-                    y_events[e].append(_array_from(&buf[0], n))
-
-                if terminate:
-                    status = 1
-                    t = roots[n_active - 1]
-                    solver._dense_eval(t, &y_term[0])
-                    y_ptr = &y_term[0]
-
+            _check(fni_events_check(s, events.ev, n_events, &g[0], &g_new[0], &counts[0],
+                                    &found[0], &roots[0], &n_found, &terminate, &buf[0]))
+            for k in range(n_found):
+                e = found[k]
+                root = roots[k]
+                t_events[e].append(root)
+                fni_solver_dense_eval(s, root, &buf[0])
+                y_events[e].append(_array_from(&buf[0], n))
+            if terminate:
+                status = 1
+                t = roots[n_found - 1]
+                fni_solver_dense_eval(s, t, &y_term[0])
+                y_ptr = &y_term[0]
             g, g_new = g_new, g
 
         if not has_t_eval:
@@ -1203,14 +1785,14 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
                 traj.push_row(t, y_ptr)
         else:
             # The value in t_eval equal to t is included.
-            if solver.direction > 0:
+            if s.direction > 0:
                 t_eval_i_new = _searchsorted(t_eval, t, False)
                 if t_eval_i_new > t_eval_i:
                     solver._ensure_dense()
                     for j in range(t_eval_i, t_eval_i_new):
                         idx = traj.push(t_eval[j])
                         if n > 0:
-                            solver._dense_eval(t_eval[j], &traj.r[idx, 0])
+                            fni_solver_dense_eval(s, t_eval[j], &traj.r[idx, 0])
                     t_eval_i = t_eval_i_new
             else:
                 t_eval_i_new = _searchsorted(t_eval, t, True)
@@ -1219,7 +1801,7 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
                     for j in range(t_eval_i - 1, t_eval_i_new - 1, -1):
                         idx = traj.push(t_eval[j])
                         if n > 0:
-                            solver._dense_eval(t_eval[j], &traj.r[idx, 0])
+                            fni_solver_dense_eval(s, t_eval[j], &traj.r[idx, 0])
                     t_eval_i = t_eval_i_new
             if bounds is not None:
                 bounds.push(t)
@@ -1238,16 +1820,47 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
 
     if dense_output:
         sol = OdeSolution(ts if not has_t_eval else bounds.times(),
-                          segs.rows(), solver.dense_kind, n, ncoef)
+                          segs.rows(), s.tab.dense_kind, n, ncoef)
     else:
         sol = None
 
     return OdeResult(
         t=ts, y=ys, sol=sol, t_events=t_events_out, y_events=y_events_out,
-        nfev=solver.nfev, njev=0, nlu=0, status=status, message=message,
-        success=status >= 0, n_accepted=solver.n_accepted,
-        n_rejected=solver.n_rejected,
+        nfev=s.nfev, njev=0, nlu=0, status=status, message=message,
+        success=status >= 0, n_accepted=s.n_accepted, n_rejected=s.n_rejected,
     )
+
+
+def _resolve_method(method):
+    if isinstance(method, str):
+        if method not in METHODS:
+            raise ValueError(f"`method` must be one of {list(METHODS)} or a "
+                             "RungeKutta subclass.")
+        return METHODS[method]
+    if isinstance(method, type) and issubclass(method, RungeKutta):
+        return method
+    raise ValueError(f"`method` must be one of {list(METHODS)} or a RungeKutta subclass.")
+
+
+def _normalize_args(args):
+    if args is None:
+        return None
+    try:
+        return tuple(args)
+    except TypeError as exp:
+        raise TypeError(
+            "Supplied 'args' cannot be unpacked. Please supply `args`"
+            f" as a tuple (e.g. `args=({args},)`)"
+        ) from exp
+
+
+def _as_system(fun, args, vectorized):
+    if isinstance(fun, OdeSystem):
+        if args is not None:
+            raise TypeError("`args` cannot be used with a native OdeSystem; set "
+                            "runtime parameters with `system.params = ...` instead.")
+        return fun
+    return PythonOdeSystem(fun, () if args is None else args, vectorized)
 
 
 def solve_ivp(fun, t_span, y0, method="RK45", t_eval=None, dense_output=False,
@@ -1277,7 +1890,8 @@ def solve_ivp(fun, t_span, y0, method="RK45", t_eval=None, dense_output=False,
     vectorized : bool
         For Python callables: call ``fun`` with ``y`` of shape (n, 1).
     args : tuple, optional
-        Extra arguments for Python callables ``fun`` and ``events``.
+        Extra arguments for Python callables ``fun`` and ``events``. Native
+        systems take runtime parameters through ``system.params`` instead.
     **options
         ``first_step``, ``max_step``, ``rtol``, ``atol`` (scalar or per
         component). Unknown options trigger a warning, as in scipy.
@@ -1291,35 +1905,10 @@ def solve_ivp(fun, t_span, y0, method="RK45", t_eval=None, dense_output=False,
     """
     cdef Py_ssize_t t_eval_i = 0
 
-    if isinstance(method, str):
-        if method not in METHODS:
-            raise ValueError(f"`method` must be one of {list(METHODS)} or a "
-                             "RungeKutta subclass.")
-        solver_cls = METHODS[method]
-    elif isinstance(method, type) and issubclass(method, RungeKutta):
-        solver_cls = method
-    else:
-        raise ValueError(f"`method` must be one of {list(METHODS)} or a "
-                         "RungeKutta subclass.")
-
+    solver_cls = _resolve_method(method)
     t0, tf = map(float, t_span)
-
-    if args is not None:
-        try:
-            args = tuple(args)
-        except TypeError as exp:
-            raise TypeError(
-                "Supplied 'args' cannot be unpacked. Please supply `args`"
-                f" as a tuple (e.g. `args=({args},)`)"
-            ) from exp
-
-    if isinstance(fun, OdeSystem):
-        if args is not None:
-            raise TypeError("`args` cannot be used with a native OdeSystem; "
-                            "store parameters on the system instead.")
-        system = fun
-    else:
-        system = PythonOdeSystem(fun, () if args is None else args, vectorized)
+    args = _normalize_args(args)
+    system = _as_system(fun, args, vectorized)
 
     if t_eval is not None:
         t_eval = np.asarray(t_eval, dtype=np.float64)
@@ -1340,7 +1929,125 @@ def solve_ivp(fun, t_span, y0, method="RK45", t_eval=None, dense_output=False,
 
     solver = solver_cls(system, t0, y0, tf, **options)
 
-    event_list, max_events, event_dir = _prepare_events(events, args)
+    event_list, max_events, _ = _prepare_events(events, args)
+    ev_array = _EventArray(event_list, max_events, solver.n)
 
-    return _drive(solver, t0, t_eval, t_eval_i, dense_output, event_list,
-                  max_events, event_dir)
+    return _drive(solver, t0, t_eval, t_eval_i, dense_output, ev_array)
+
+
+# =============================================================================
+# Endpoint integration on the C API
+# =============================================================================
+
+def integrate(fun, t_span, y0, method="RK45", *, rtol=1e-3, atol=1e-6, first_step=None,
+              max_step=np.inf, events=None, args=None, max_records=1024, release_gil=None):
+    """Integrate to the end of ``t_span`` (or a terminal event) via ``fni_integrate``.
+
+    The lean counterpart to :func:`solve_ivp` for when only the endpoint (and
+    the event locations) matter, as in shooting methods. No trajectory is
+    stored. It takes exactly the same steps as :func:`solve_ivp`.
+
+    If ``fun`` and every event provide a native C function (``has_native_fn``),
+    the whole integration runs without the GIL, so Python threads calling
+    ``integrate`` run in parallel. ``release_gil=True`` demands that (raising if
+    impossible), ``False`` keeps the GIL, and ``None`` decides automatically.
+
+    Returns
+    -------
+    OdeResult
+        ``t`` (final time), ``y`` (final state, shape (n,)), ``status``,
+        ``message``, ``success``, ``nfev``, ``n_accepted``, ``n_rejected``,
+        ``t_events`` / ``y_events`` (as in solve_ivp; ``None`` without events),
+        ``n_event_records`` (all located events, which may exceed
+        ``max_records``) and ``gil_released``.
+    """
+    cdef fni_options opt
+    cdef fni_stats stats
+    cdef void* ctx
+    cdef fni_rhs_fn fn
+    cdef double[::1] y0_view, y_out, rtol_view, atol_view, rec_t, rec_y_flat
+    cdef Py_ssize_t[::1] rec_e
+    cdef Py_ssize_t n, cap
+    cdef int m, rc
+    cdef double t0, t1
+    cdef bint nogil_ok
+    cdef _EventArray ev_array
+
+    solver_cls = _resolve_method(method)
+    m = METHOD_IDS[solver_cls.__name__] if solver_cls.__name__ in METHOD_IDS else -1
+    if m < 0:
+        raise ValueError("integrate() supports RK23, RK45 and DOP853")
+    t0, t1 = map(float, t_span)
+    args = _normalize_args(args)
+    system = _as_system(fun, args, False)
+
+    y0_arr = np.array(y0, dtype=np.float64, copy=True).reshape(-1)
+    if not np.isfinite(y0_arr).all():
+        raise ValueError("All components of the initial state `y0` must be finite.")
+    n = y0_arr.shape[0]
+    (<OdeSystem> system).check_size(n)
+    if not max_step > 0:
+        raise ValueError("`max_step` must be positive.")
+    if first_step is not None and not (0 < first_step <= abs(t1 - t0)):
+        raise ValueError("`first_step` must be positive and within bounds.")
+    rtol_arr = np.maximum(np.asarray(rtol, dtype=np.float64), 100 * EPS)
+    atol_arr = np.asarray(atol, dtype=np.float64)
+    for name, arr in (("rtol", rtol_arr), ("atol", atol_arr)):
+        if arr.ndim > 0 and arr.shape != (n,):
+            raise ValueError(f"`{name}` has wrong shape.")
+    if np.any(atol_arr < 0):
+        raise ValueError("`atol` must be positive.")
+
+    rtol_view = np.array(np.broadcast_to(rtol_arr, (max(n, 1),)), dtype=np.float64)
+    atol_view = np.array(np.broadcast_to(atol_arr, (max(n, 1),)), dtype=np.float64)
+    y0_view = y0_arr if n > 0 else np.zeros(1)
+    y_out = np.zeros(max(n, 1))
+    opt.rtol = 0.0
+    opt.rtol_vec = &rtol_view[0]
+    opt.atol = 0.0
+    opt.atol_vec = &atol_view[0]
+    opt.first_step = -1.0 if first_step is None else float(first_step)
+    opt.max_step = max_step
+
+    event_list, max_events, _ = _prepare_events(events, args)
+    ev_array = _EventArray(event_list, max_events, n)
+    cap = max(int(max_records), 0) if ev_array.n > 0 else 0
+    rec_e = np.zeros(max(cap, 1), dtype=np.intp)
+    rec_t = np.zeros(max(cap, 1))
+    rec_y_flat = np.zeros(max(cap * n, 1))
+
+    fn = _rhs_of(<OdeSystem> system, &ctx)
+    nogil_ok = (<OdeSystem> system).c_fn != NULL and ev_array.all_native
+    if release_gil is None:
+        release_gil = nogil_ok
+    elif release_gil and not nogil_ok:
+        raise TypeError("release_gil=True needs a native c_fn on the system and every event")
+
+    if release_gil:
+        with nogil:
+            rc = fni_integrate(m, fn, ctx, n, t0, &y0_view[0], t1, &opt, ev_array.ev, ev_array.n,
+                               &y_out[0], &rec_e[0], &rec_t[0], &rec_y_flat[0], cap, &stats)
+    else:
+        rc = fni_integrate(m, fn, ctx, n, t0, &y0_view[0], t1, &opt, ev_array.ev, ev_array.n,
+                           &y_out[0], &rec_e[0], &rec_t[0], &rec_y_flat[0], cap, &stats)
+    _check(rc)
+
+    if ev_array.n > 0:
+        k_rec = min(stats.n_records, cap)
+        e_arr = np.asarray(rec_e)[:k_rec]
+        t_arr = np.asarray(rec_t)[:k_rec]
+        y_arr = np.asarray(rec_y_flat)[:k_rec * n].reshape(k_rec, n)
+        t_events = [t_arr[e_arr == e].copy() for e in range(ev_array.n)]
+        y_events = [y_arr[e_arr == e].copy() if np.any(e_arr == e) else np.asarray([])
+                    for e in range(ev_array.n)]
+    else:
+        t_events = y_events = None
+
+    status = stats.status
+    return OdeResult(
+        t=stats.t_final, y=np.asarray(y_out)[:n].copy(), status=status,
+        message=MESSAGES.get(status, MSG_TOO_SMALL_STEP), success=status >= 0,
+        nfev=stats.nfev, n_accepted=stats.n_accepted, n_rejected=stats.n_rejected,
+        t_events=t_events, y_events=y_events, n_event_records=stats.n_records,
+        gil_released=bool(release_gil),
+    )
