@@ -46,8 +46,20 @@ RHS evaluations as `solve_ivp`. State-sized work is done in typed-memoryview loo
 over buffers that cnumpy allocates once per solve. The step loop makes no NumPy
 calls and creates no temporary arrays. Right-hand sides are `cdef` subclasses of
 `OdeSystem`, and the integrator calls them through the vtable. A Python callable
-also works through an adapter, which is slower. Dense output, `t_eval`, and
-events are not implemented yet.
+also works through an adapter, which is slower.
+
+**Milestone 3b — the rest of `solve_ivp` (done).** `t_eval`, `dense_output`
+(an `OdeSolution`), `events` (`terminal` as a bool or a count, plus
+`direction`), `vectorized`, `args`, per-component `rtol`/`atol`, `first_step`,
+`max_step`, and SciPy's validation and warnings are all supported. Output
+points, interpolants, and event times and states match SciPy to round-off,
+with identical RHS evaluation counts. That includes DOP853's 3 extra
+dense-output stages, which are evaluated only when an interpolant is needed.
+Event roots are found with a C port of SciPy's `brentq`. Events can be native
+`EventFunction` subclasses, such as the built-in `ComponentCrossing`, so a fully
+compiled problem never calls into Python. The stepper classes mirror
+`scipy.integrate.OdeSolver` (`step()`, `dense_output()`, `t_old`, `step_size`).
+Not supported: complex-valued `y0`.
 
 Package layout (`src/` layout):
 
@@ -65,20 +77,40 @@ setup.py                # Cython extension build (metadata stays in pyproject.to
 
 ### Using the Cython engine
 
+`integrators.solve_ivp` takes the same arguments as `scipy.integrate.solve_ivp`
+(default method `RK45`):
+
 ```python
-from fast_numerical_integration.integrators import solve_ivp
+import numpy as np
+from fast_numerical_integration.integrators import ComponentCrossing, solve_ivp
 from fast_numerical_integration.three_body import figure_eight_system
 
 system = figure_eight_system()
-sol = solve_ivp(system.native_rhs(), (0.0, system.period), system.y0,
-                method="DOP853", rtol=1e-10, atol=1e-12)
-sol.t, sol.y, sol.nfev       # same layout as scipy's OdeResult (no t_eval)
+sol = solve_ivp(
+    system.native_rhs(), (0.0, system.period), system.y0, method="DOP853",
+    t_eval=np.linspace(0.0, system.period, 2000), dense_output=True,
+    events=[ComponentCrossing(1, direction=1)],    # y1 crosses 0 upward
+    rtol=1e-10, atol=1e-12,
+)
+sol.t, sol.y              # solution at t_eval
+sol.sol(1.234)            # dense interpolant anywhere in the interval
+sol.t_events, sol.y_events
 ```
 
-To write a native RHS, subclass `OdeSystem` in a `.pyx` file and implement
-`cdef int eval(self, double t, const double* y, double* dydt, Py_ssize_t n) except -1`.
+Plain Python RHS and event callables also work, with SciPy's `terminal` and
+`direction` attributes. They are slower because every call goes back through
+Python.
+
+To write a native RHS or event, subclass `OdeSystem` or `EventFunction` in a
+`.pyx` file and implement its `cdef eval`:
+
+```cython
+cdef int eval(self, double t, const double* y, double* dydt, Py_ssize_t n) except -1   # OdeSystem
+cdef double eval(self, double t, const double* y, Py_ssize_t n) except? -1              # EventFunction
+```
+
 `nbody.pyx` is an example. The SymPy-generated C kernels in later milestones will
-plug in through this same hook.
+plug in through the same hook.
 
 ## Quickstart
 
@@ -156,8 +188,8 @@ uv run pytest
       `RK45`, and `DOP853` on the same system (baseline numbers to beat).
 - [x] **Milestone 3** — Cython RK23 / RK45 / DOP853 with adaptive steps, matching
       SciPy step for step; native `OdeSystem` RHS interface.
-- [ ] **Milestone 3b** — Dense output, `t_eval` / required output times, and
-      event detection.
+- [x] **Milestone 3b** — Dense output, `t_eval`, events, and the rest of
+      SciPy's `solve_ivp` options for these methods.
 - [ ] **Milestone 4** — SymPy → C code printing for the RHS.
 - [ ] **Milestone 5** — Build glue that compiles the generated C into an
       `OdeSystem` subclass; benchmark against the baseline.
