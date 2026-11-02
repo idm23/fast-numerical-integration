@@ -9,16 +9,22 @@ Step *times* are compared only loosely. The embedded error estimate
 difference. A different floating-point summation order (our loops vs. BLAS)
 moves it far more than machine epsilon, and the controller passes that change on
 to ``h``. The final state at the shared endpoint is compared tightly.
+
+Exact comparisons (RHS evaluation counts, step sequences) are made against
+SciPy run with our summation order (``testing.matched_solve_ivp``), which is
+bit-identical to our engine on every platform. Stock SciPy's rounding varies
+with the platform's SIMD kernels and C runtime, so its exact counts can move
+in rounding-sensitive regimes (seen on Linux aarch64, macOS and Windows CI).
 """
 
 import numpy as np
 import pytest
-from scipy.integrate import solve_ivp as scipy_solve_ivp
 
 from fast_numerical_integration import integrators, tableaus
 from fast_numerical_integration.integrators import OdeSystem, solve_ivp
 from fast_numerical_integration.nbody import NBodyGravity
 from fast_numerical_integration.three_body import figure_eight_system
+from fast_numerical_integration.testing import matched_solve_ivp
 
 METHODS = ("RK23", "RK45", "DOP853")
 TOLERANCES = [(1e-3, 1e-6), (1e-8, 1e-10), (1e-11, 1e-13)]
@@ -58,7 +64,7 @@ def test_native_rhs_matches_numpy_rhs():
 def test_matches_scipy_step_for_step(method, rtol, atol, native):
     system = figure_eight_system()
     t_span = (0.0, system.period)
-    ref = scipy_solve_ivp(system.rhs, t_span, system.y0, method=method, rtol=rtol, atol=atol)
+    ref = matched_solve_ivp(system.rhs, t_span, system.y0, method=method, rtol=rtol, atol=atol)
     fun = system.native_rhs() if native else system.rhs
     sol = solve_ivp(fun, t_span, system.y0, method=method, rtol=rtol, atol=atol)
 
@@ -83,7 +89,7 @@ def test_exponential_decay_accuracy(method):
 @pytest.mark.parametrize("method", METHODS)
 def test_backward_integration_matches_scipy(method):
     y0 = np.array([1.0, 2.0])
-    ref = scipy_solve_ivp(_decay, (2.0, -1.0), y0, method=method, rtol=1e-8, atol=1e-10, args=(0.5,))
+    ref = matched_solve_ivp(_decay, (2.0, -1.0), y0, method=method, rtol=1e-8, atol=1e-10, args=(0.5,))
     sol = solve_ivp(_decay, (2.0, -1.0), y0, method=method, rtol=1e-8, atol=1e-10, args=(0.5,))
     assert sol.success
     assert sol.nfev == ref.nfev
@@ -100,7 +106,7 @@ def test_vector_atol_first_step_and_max_step(method):
     atol = np.linspace(1e-12, 1e-9, system.y0.size)
     kw = dict(method=method, rtol=1e-8, atol=atol, first_step=1e-3, max_step=0.05)
     t_span = (0.0, system.period)
-    ref = scipy_solve_ivp(system.rhs, t_span, system.y0, **kw)
+    ref = matched_solve_ivp(system.rhs, t_span, system.y0, **kw)
     sol = solve_ivp(system.native_rhs(), t_span, system.y0, **kw)
     assert sol.nfev == ref.nfev
     assert sol.t.shape == ref.t.shape
@@ -110,7 +116,7 @@ def test_vector_atol_first_step_and_max_step(method):
 
 def test_zero_length_interval_matches_scipy():
     y0 = np.array([1.0, 2.0])
-    ref = scipy_solve_ivp(_decay, (1.0, 1.0), y0, args=(1.0,))
+    ref = matched_solve_ivp(_decay, (1.0, 1.0), y0, args=(1.0,))
     sol = solve_ivp(_decay, (1.0, 1.0), y0, args=(1.0,))
     assert sol.success
     np.testing.assert_array_equal(sol.t, ref.t)
