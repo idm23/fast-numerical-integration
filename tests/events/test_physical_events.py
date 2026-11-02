@@ -137,20 +137,20 @@ def test_bouncing_ball_matches_scipy(method, native_event):
     with scipy_with_our_summation_order():
         matched = events.bounce(scipy_solve_ivp, native_rhs=True, native_event=False, **kw)
     stock = events.bounce(scipy_solve_ivp, native_rhs=False, native_event=False, **kw)
-    assert ours["nfev"] == matched["nfev"]
-    # Same steps; impact times can still differ by ~1 ulp, because the
-    # matched-order patch covers stepping only. Dense output is evaluated in
-    # Horner form here and by cumulative products in scipy, which moves
-    # Brent's root in the last bit. Each restart starts from the previous
-    # root, so these ulps compound over 15 bounces (to ~1e-14 for DOP853).
-    np.testing.assert_allclose(ours["times"], matched["times"], rtol=1e-12)
-    # The parabola is integrated exactly, so DOP853's error estimate is pure
-    # round-off and its step count is rounding-sensitive (RK23/RK45 match stock
-    # scipy exactly).
+    # The parabola is integrated exactly, so the error estimates are pure
+    # round-off. RK23/RK45's step factor is then clamped at MAX_FACTOR = 10
+    # whatever the noise, so their step sequence is deterministic and must
+    # match exactly. DOP853's factor SAFETY * err^(-1/8) sits right at the
+    # clamp, so the noise decides. With 1-ulp differences in each restart
+    # state (event roots go through dense output, which the matched-order run
+    # does not patch), its count can differ on some platforms (seen on macOS).
     if method == "DOP853":
+        assert ours["nfev"] == pytest.approx(matched["nfev"], rel=0.15)
         assert ours["nfev"] == pytest.approx(stock["nfev"], rel=0.15)
     else:
-        assert ours["nfev"] == stock["nfev"]
+        assert ours["nfev"] == matched["nfev"] == stock["nfev"]
+    # Impact times are fixed by physics, so they agree tightly regardless.
+    np.testing.assert_allclose(ours["times"], matched["times"], rtol=1e-12)
     np.testing.assert_allclose(ours["times"], stock["times"], rtol=1e-12)
 
 

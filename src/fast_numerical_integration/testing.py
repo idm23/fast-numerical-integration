@@ -88,3 +88,22 @@ def scipy_with_our_summation_order():
     finally:
         (scipy_rk.rk_step, scipy_rk.RungeKutta._estimate_error_norm,
          scipy_rk.DOP853._estimate_error_norm, scipy_common.norm) = saved
+
+
+def matched_solve_ivp(*args, **kwargs):
+    """:func:`scipy.integrate.solve_ivp` run under :func:`scipy_with_our_summation_order`.
+
+    Use this, not stock SciPy, wherever a test requires *exact* agreement
+    (RHS evaluation counts, step sequences). Stock SciPy's rounding depends on
+    the platform (NumPy's SIMD kernels and the C runtime's ``pow``), and in
+    rounding-sensitive regimes (error estimates at the noise floor, stiff
+    problems on the stability boundary) its step counts then vary between
+    machines. The matched run uses deterministic elementwise arithmetic in our
+    order, so it is bit-identical to our engine on every platform.
+
+    Dense output is not patched: event roots can still differ by an ulp.
+    """
+    from scipy.integrate import solve_ivp as scipy_solve_ivp
+
+    with scipy_with_our_summation_order():
+        return scipy_solve_ivp(*args, **kwargs)

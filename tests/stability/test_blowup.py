@@ -8,15 +8,21 @@ report success.
 The numerical solution blows up at a slightly perturbed time ``1 + O(tol)``:
 the discrete RK map has its own pole, offset from the exact one by the local
 error. The stopping time converges to 1 as the tolerance tightens.
+
+Exact comparisons (RHS evaluation counts, step sequences) are made against
+SciPy run with our summation order (``testing.matched_solve_ivp``), which is
+bit-identical to our engine on every platform. Stock SciPy's rounding varies
+with the platform's SIMD kernels and C runtime, so its exact counts can move
+in rounding-sensitive regimes (seen on Linux aarch64, macOS and Windows CI).
 """
 
 import numpy as np
 import pytest
-from scipy.integrate import solve_ivp as scipy_solve_ivp
 
 from fast_numerical_integration.integrators import solve_ivp
 from fast_numerical_integration.problems import catalog
 from fast_numerical_integration.problems.native import Quadratic
+from fast_numerical_integration.testing import matched_solve_ivp
 
 METHODS = ("RK23", "RK45", "DOP853")
 
@@ -40,7 +46,7 @@ def test_fails_cleanly_at_the_singularity(method, rtol):
 def test_stops_where_scipy_stops(method):
     p = catalog.get("blowup")
     kw = dict(method=method, rtol=1e-8, atol=1e-11)
-    ref = scipy_solve_ivp(p.rhs, p.t_span, p.y0, **kw)
+    ref = matched_solve_ivp(p.rhs, p.t_span, p.y0, **kw)
     sol = solve_ivp(p.native(), p.t_span, p.y0, **kw)
     assert sol.status == ref.status == -1
     assert sol.message == ref.message

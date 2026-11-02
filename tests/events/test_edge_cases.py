@@ -5,14 +5,20 @@ with native events (where expressible), and all three must agree. Some cases
 document *limitations shared with SciPy*: sign-change detection cannot see a
 root pair inside one step, or a grazing touch. Those tests pin the behaviour
 down rather than call it a failure.
+
+Exact comparisons (RHS evaluation counts, step sequences) are made against
+SciPy run with our summation order (``testing.matched_solve_ivp``), which is
+bit-identical to our engine on every platform. Stock SciPy's rounding varies
+with the platform's SIMD kernels and C runtime, so its exact counts can move
+in rounding-sensitive regimes (seen on Linux aarch64, macOS and Windows CI).
 """
 
 import numpy as np
 import pytest
-from scipy.integrate import solve_ivp as scipy_solve_ivp
 
 from fast_numerical_integration.integrators import ComponentCrossing, solve_ivp
 from fast_numerical_integration.problems.native import LinearSystem, TimeEvent
+from fast_numerical_integration.testing import matched_solve_ivp
 
 METHODS = ("RK23", "RK45", "DOP853")
 
@@ -36,7 +42,7 @@ def _time_event(t_e, terminal=None, direction=0):
 
 
 def both(*args, **kwargs):
-    ref = scipy_solve_ivp(*args, **kwargs)
+    ref = matched_solve_ivp(*args, **kwargs)
     res = solve_ivp(*args, **kwargs)
     assert res.status == ref.status
     assert res.nfev == ref.nfev

@@ -5,12 +5,17 @@ rtol, option validation and the stepper API, all checked against
 :func:`scipy.integrate.solve_ivp`. The RHS evaluation counts must match
 exactly. Interpolated values must agree to round-off, since both engines take
 the same steps and use the same interpolants.
+
+Exact comparisons (RHS evaluation counts, step sequences) are made against
+SciPy run with our summation order (``testing.matched_solve_ivp``), which is
+bit-identical to our engine on every platform. Stock SciPy's rounding varies
+with the platform's SIMD kernels and C runtime, so its exact counts can move
+in rounding-sensitive regimes (seen on Linux aarch64, macOS and Windows CI).
 """
 
 import numpy as np
 import pytest
 import scipy.integrate as si
-from scipy.integrate import solve_ivp as scipy_solve_ivp
 
 from fast_numerical_integration import integrators
 from fast_numerical_integration.integrators import (
@@ -20,6 +25,7 @@ from fast_numerical_integration.integrators import (
     solve_ivp,
 )
 from fast_numerical_integration.three_body import figure_eight_system
+from fast_numerical_integration.testing import matched_solve_ivp
 
 METHODS = ("RK23", "RK45", "DOP853")
 TOL = dict(rtol=1e-9, atol=1e-11)
@@ -45,7 +51,7 @@ def _close(a, b, atol=1e-10):
 def test_t_eval_matches_scipy(system, method, backward):
     span = _spans(system)[backward]
     t_eval = np.linspace(span[0], span[1], 57)
-    ref = scipy_solve_ivp(system.rhs, span, system.y0, method=method, t_eval=t_eval, **TOL)
+    ref = matched_solve_ivp(system.rhs, span, system.y0, method=method, t_eval=t_eval, **TOL)
     sol = solve_ivp(system.native_rhs(), span, system.y0, method=method, t_eval=t_eval, **TOL)
     assert sol.nfev == ref.nfev
     np.testing.assert_array_equal(sol.t, ref.t)
@@ -56,7 +62,7 @@ def test_t_eval_matches_scipy(system, method, backward):
 
 def test_t_eval_subset_of_interval(system):
     t_eval = [1.0, 2.0, 2.5]
-    ref = scipy_solve_ivp(system.rhs, (0.0, system.period), system.y0, method="DOP853", t_eval=t_eval, **TOL)
+    ref = matched_solve_ivp(system.rhs, (0.0, system.period), system.y0, method="DOP853", t_eval=t_eval, **TOL)
     sol = solve_ivp(system.rhs, (0.0, system.period), system.y0, method="DOP853", t_eval=t_eval, **TOL)
     assert sol.nfev == ref.nfev
     _close(sol.y, ref.y)
@@ -80,7 +86,7 @@ def test_t_eval_validation():
 @pytest.mark.parametrize("backward", [False, True], ids=["fwd", "bwd"])
 def test_dense_output_matches_scipy(system, method, backward):
     span = _spans(system)[backward]
-    ref = scipy_solve_ivp(system.rhs, span, system.y0, method=method, dense_output=True, **TOL)
+    ref = matched_solve_ivp(system.rhs, span, system.y0, method=method, dense_output=True, **TOL)
     sol = solve_ivp(system.native_rhs(), span, system.y0, method=method, dense_output=True, **TOL)
     assert sol.nfev == ref.nfev
     assert isinstance(sol.sol, OdeSolution)
@@ -102,7 +108,7 @@ def test_dense_output_matches_scipy(system, method, backward):
 def test_dense_output_with_t_eval_uses_step_breakpoints(system):
     t_eval = np.linspace(0, system.period, 11)
     kw = dict(method="RK45", t_eval=t_eval, dense_output=True, **TOL)
-    ref = scipy_solve_ivp(system.rhs, (0.0, system.period), system.y0, **kw)
+    ref = matched_solve_ivp(system.rhs, (0.0, system.period), system.y0, **kw)
     sol = solve_ivp(system.native_rhs(), (0.0, system.period), system.y0, **kw)
     assert sol.nfev == ref.nfev
     assert sol.t.shape == (11,)
@@ -111,7 +117,7 @@ def test_dense_output_with_t_eval_uses_step_breakpoints(system):
 
 
 def test_dense_output_zero_length_interval():
-    ref = scipy_solve_ivp(lambda t, y: -y, (1.0, 1.0), [1.0, 2.0], dense_output=True)
+    ref = matched_solve_ivp(lambda t, y: -y, (1.0, 1.0), [1.0, 2.0], dense_output=True)
     sol = solve_ivp(lambda t, y: -y, (1.0, 1.0), [1.0, 2.0], dense_output=True)
     np.testing.assert_array_equal(sol.t, ref.t)
     np.testing.assert_array_equal(sol.sol(1.0), ref.sol(1.0))
@@ -165,7 +171,7 @@ def _assert_events_match(sol, ref):
 @pytest.mark.parametrize("native", [False, True], ids=["pyevent", "native"])
 def test_events_match_scipy(system, method, backward, native):
     span = _spans(system)[backward]
-    ref = scipy_solve_ivp(system.rhs, span, system.y0, method=method, events=_crossing_events(), **TOL)
+    ref = matched_solve_ivp(system.rhs, span, system.y0, method=method, events=_crossing_events(), **TOL)
     events = _native_crossing_events() if native else _crossing_events()
     sol = solve_ivp(system.native_rhs(), span, system.y0, method=method, events=events, **TOL)
     assert sol.status == ref.status == 0
@@ -186,7 +192,7 @@ def test_terminal_events_match_scipy(system, method, terminal):
         return y[0] - 0.5
 
     kw = dict(method=method, dense_output=True, t_eval=np.linspace(0, system.period, 200), **TOL)
-    ref = scipy_solve_ivp(system.rhs, (0.0, system.period), system.y0, events=[y1, x1_half], **kw)
+    ref = matched_solve_ivp(system.rhs, (0.0, system.period), system.y0, events=[y1, x1_half], **kw)
     native = [ComponentCrossing(1, terminal=terminal), ComponentCrossing(0, 0.5)]
     sol = solve_ivp(system.native_rhs(), (0.0, system.period), system.y0, events=native, **kw)
 
@@ -206,7 +212,7 @@ def test_terminal_event_final_point_without_t_eval(system):
         return y[1]
 
     y1.terminal = True
-    ref = scipy_solve_ivp(system.rhs, (0.0, system.period), system.y0, method="DOP853", events=y1, **TOL)
+    ref = matched_solve_ivp(system.rhs, (0.0, system.period), system.y0, method="DOP853", events=y1, **TOL)
     sol = solve_ivp(system.native_rhs(), (0.0, system.period), system.y0, method="DOP853", events=y1, **TOL)
     assert sol.t[-1] == pytest.approx(ref.t[-1], abs=1e-12)
     assert sol.t[-1] == sol.t_events[0][0]
@@ -246,7 +252,7 @@ def test_no_events_gives_empty_arrays_like_scipy():
     def never(t, y):
         return 1.0
 
-    ref = scipy_solve_ivp(lambda t, y: -y, (0, 1), [1.0], events=never)
+    ref = matched_solve_ivp(lambda t, y: -y, (0, 1), [1.0], events=never)
     sol = solve_ivp(lambda t, y: -y, (0, 1), [1.0], events=never)
     assert sol.t_events[0].shape == ref.t_events[0].shape == (0,)
     assert sol.y_events[0].shape == ref.y_events[0].shape
@@ -290,7 +296,7 @@ def test_vectorized_python_rhs(system):
         calls.append(y.shape)
         return -0.5 * y
 
-    ref = scipy_solve_ivp(f, (0, 2), [1.0, 2.0], vectorized=True)
+    ref = matched_solve_ivp(f, (0, 2), [1.0, 2.0], vectorized=True)
     calls.clear()
     sol = solve_ivp(f, (0, 2), [1.0, 2.0], vectorized=True)
     assert set(calls) == {(2, 1)}
@@ -301,14 +307,14 @@ def test_vectorized_python_rhs(system):
 @pytest.mark.parametrize("method", METHODS)
 def test_per_component_rtol(system, method):
     rtol = np.geomspace(1e-10, 1e-6, 12)
-    ref = scipy_solve_ivp(system.rhs, (0, system.period), system.y0, method=method, rtol=rtol, atol=1e-12)
+    ref = matched_solve_ivp(system.rhs, (0, system.period), system.y0, method=method, rtol=rtol, atol=1e-12)
     sol = solve_ivp(system.native_rhs(), (0, system.period), system.y0, method=method, rtol=rtol, atol=1e-12)
     assert sol.nfev == ref.nfev
     _close(sol.y[:, -1], ref.y[:, -1], atol=1e-8)
 
 
 def test_default_method_is_rk45_like_scipy(system):
-    ref = scipy_solve_ivp(system.rhs, (0, system.period), system.y0)
+    ref = matched_solve_ivp(system.rhs, (0, system.period), system.y0)
     sol = solve_ivp(system.native_rhs(), (0, system.period), system.y0)
     assert sol.nfev == ref.nfev
 
