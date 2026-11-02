@@ -72,8 +72,49 @@ src/fast_numerical_integration/
   visualize.py          # plot_trajectories(solution, out_path) -> PNG
   main.py               # main(): solve with solve_ivp, print stats, write outputs/figure_eight.png
   benchmark.py          # timing harness: scipy vs cython (Python RHS) vs cython (native RHS)
+  suite.py              # fni-suite: benchmark + figures for every catalog problem and event scenario
+  testing.py            # run SciPy with our summation order (bit-identical comparisons)
+  problems/
+    catalog.py          # 41 canonical test problems: RHS, exact/published references, invariants
+    native.pyx          # native (Cython) RHS and event classes for every catalog problem
+    events.py           # event scenarios with exact event times (apsides, pendulum, bouncing ball)
 setup.py                # Cython extension build (metadata stays in pyproject.toml)
 ```
+
+**Milestone 3c — canonical test suite (done).** A catalog of 41 standard
+problems, each with a NumPy RHS and an equivalent native one:
+
+- **DETEST** A1–E5, with the published reference end values (Hull et al. 1972;
+  Enright & Pryce 1987).
+- **Hairer–Nørsett–Wanner:** Arenstorf, Pleiades, Brusselator.
+- **Long-time:** Kepler over 100–1000 orbits, the outer solar system over
+  2×10⁵ days, the figure-eight choreography over 50 periods.
+- **Stability:** Prothero–Robinson, Van der Pol for μ = 1…1000, Robertson,
+  Lorenz, finite-time blow-up.
+- **Event scenarios:** Kepler apsides, a large-amplitude pendulum, a bouncing
+  ball with restarts.
+
+The tests are grouped by the oracle they check against:
+
+| directory | checks |
+|---|---|
+| `tests/parity/` | SciPy's own `solve_ivp` tests, ported; RHS-evaluation parity on every catalog problem; **bit-identical** trajectories against SciPy patched to our summation order |
+| `tests/accuracy/` | DETEST global error vs tolerance; observed order 3/5/8 with fixed steps; dense-output order; references cross-checked against Radau and LSODA |
+| `tests/long_time/` | Kepler: linear invariant drift and quadratic phase-error growth; two independent solar-system formulations agree; linear invariants exact to round-off |
+| `tests/stability/` | step size rides the stability boundary computed from each tableau (2.51 / 3.31 / 6.39); stiffness scaling; blow-up; Lorenz error growth at the Lyapunov rate |
+| `tests/events/` | exact event times on physical problems; edge cases (t0, t_end, simultaneous/terminal ordering, root pairs and grazing touches missed exactly as in SciPy) |
+| `tests/baseline/` | SciPy baseline, benchmark harness, suite smoke test |
+
+Findings worth knowing:
+
+- RK23 and RK45 match SciPy's RHS-evaluation count on every problem. DOP853
+  can differ by a few percent: its error estimate is a heavily cancelling
+  sum, so near round-off level summation order flips accept/reject decisions.
+  SciPy shows the same sensitivity to a 1-ulp change in `y0`. With SciPy
+  patched to our summation order (`fast_numerical_integration.testing`),
+  every trajectory is bit-identical.
+- RK45 at rtol=1e-3 goes unstable on Robertson (|y| ~ 1e7, then fails). This
+  is a known Dormand–Prince stiffness pathology, and SciPy does the same.
 
 ### Using the Cython engine
 
@@ -175,10 +216,28 @@ than `solve_ivp`. With the Python RHS the gain is only ~1.3x, so most of SciPy's
 time is spent calling the Python RHS. That is why the remaining milestones
 generate compiled kernels. Numbers vary by machine.
 
+### Benchmark and visualize every problem
+
+```bash
+uv run fni-suite                    # all problems + event scenarios, ~2 minutes
+uv run fni-suite --problems D5 pleiades --quick
+```
+
+This writes one figure per problem to `outputs/suite/<group>/<name>.png`. Each
+figure shows the solution, error along the trajectory (or conserved-quantity
+drift, or step size), a DOP853 work-precision curve and wall-time bars for
+SciPy and Cython. It also writes one figure per event scenario and
+`summary_speedup.png`, plus `summary.md` / `summary.csv` tables. Cython's
+end-to-end speedup with DOP853 ranges from about 6× (C4, a dense 51×51 linear
+system, where the work is the same matrix-vector product as NumPy's) to about
+500× (outer solar system), with identical step counts and accuracy.
+
 Run the tests:
 
 ```bash
-uv run pytest
+uv run pytest               # ~1.5 minutes
+uv run pytest --runslow     # include long integrations
+uv run pytest tests/events  # one oracle group
 ```
 
 ## Roadmap
@@ -190,6 +249,8 @@ uv run pytest
       SciPy step for step; native `OdeSystem` RHS interface.
 - [x] **Milestone 3b** — Dense output, `t_eval`, events, and the rest of
       SciPy's `solve_ivp` options for these methods.
+- [x] **Milestone 3c** — Canonical test problems (DETEST, Hairer, long-time,
+      stability, events), split by oracle, with a benchmark/figure suite.
 - [ ] **Milestone 4** — SymPy → C code printing for the RHS.
 - [ ] **Milestone 5** — Build glue that compiles the generated C into an
       `OdeSystem` subclass; benchmark against the baseline.

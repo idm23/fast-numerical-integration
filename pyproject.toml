@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 fni = "fast_numerical_integration.main:main"
 fni-bench = "fast_numerical_integration.benchmark:main"
+fni-suite = "fast_numerical_integration.suite:main"
 
 [dependency-groups]
 dev = [
@@ -34,4 +35,13 @@ cache-keys = [
     { file = "setup.py" },
     { file = "src/**/*.pyx" },
     { file = "src/**/*.pxd" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# importlib mode lets test files in different directories share basenames
+# without __init__.py files.
+addopts = "--import-mode=importlib"
+markers = [
+    "slow: long-running integrations (run with --runslow)",
 ]
