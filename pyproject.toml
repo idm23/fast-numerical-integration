@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "cython>=3.0"]
+requires = ["setuptools>=68", "cython>=3.0", "numpy>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -26,3 +26,12 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+
+[tool.uv]
+# Rebuild the Cython extensions whenever their sources change.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { file = "src/**/*.pyx" },
+    { file = "src/**/*.pxd" },
+]
