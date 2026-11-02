@@ -209,11 +209,11 @@ pip install fast-numerical-integration            # or: uv add fast-numerical-in
 pip install "fast-numerical-integration[plot]"    # + matplotlib, for fni / fni-suite / visualize
 ```
 
-Pre-built wheels cover Linux (x86_64, aarch64), macOS (Intel, Apple Silicon)
-and Windows for CPython 3.11–3.14, so no compiler is needed. Every wheel passes
-the full test suite on its own platform before it is published. All
-extensions are built with floating-point contraction off, so results are
-identical across platforms.
+Pre-built wheels cover Linux x86_64 and macOS on Apple Silicon for CPython
+3.11–3.14, and every wheel passes the full test suite before it's
+published. Other platforms install from the source distribution, which needs
+a C compiler. All extensions are built with floating-point contraction off,
+so results are identical across platforms.
 
 To `cimport` the C API from your own Cython package, add
 `fast-numerical-integration` and `cython` to your `[build-system] requires`.

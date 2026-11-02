@@ -1,7 +1,7 @@
 name: Release
 
-# Builds the sdist and wheels for Linux (x86_64, aarch64), macOS (Intel, Apple
-# Silicon) and Windows, for CPython 3.11-3.14. Each wheel runs the full test
+# Builds the sdist and wheels for Linux x86_64 and macOS Apple Silicon, for
+# CPython 3.11-3.14. Each wheel runs the full test
 # suite (including slow tests) inside cibuildwheel before anything is
 # published. Publishing uses PyPI trusted publishing (OIDC), so no API tokens
 # are stored.
@@ -71,12 +71,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Wheels only for the platforms in use. Others install from the sdist
+        # (needs a C compiler, which auto-optimal-control users have anyway).
+        # Adding a platform is one line: ubuntu-24.04-arm (Linux aarch64),
+        # macos-15-intel (macOS x86_64) or windows-latest.
         os:
           - ubuntu-latest      # manylinux x86_64
-          - ubuntu-24.04-arm   # manylinux aarch64
-          - macos-15-intel     # macOS x86_64
           - macos-15           # macOS arm64 (Apple Silicon)
-          - windows-latest     # Windows AMD64
     steps:
       - uses: actions/checkout@v7
       - name: Build and test wheels
