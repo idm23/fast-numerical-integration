@@ -65,7 +65,8 @@ Package layout (`src/` layout):
 
 ```
 src/fast_numerical_integration/
-  integrators.pyx/.pxd  # OdeSystem, RK23/RK45/DOP853 steppers, solve_ivp (Cython)
+  integrators.pyx/.pxd  # GIL-free C core (fni_*), OdeSystem/EventFunction, steppers, solve_ivp, integrate
+  batch.pyx             # integrate_batch: many segments in one nogil loop (C API example)
   nbody.pyx             # NBodyGravity: native N-body RHS (stand-in for generated C)
   tableaus.py           # Butcher tableaus, bit-identical to SciPy's
   three_body.py         # figure-eight ICs, three_body_rhs, ThreeBodySystem(.native_rhs())
@@ -142,16 +143,64 @@ Plain Python RHS and event callables also work, with SciPy's `terminal` and
 `direction` attributes. They are slower because every call goes back through
 Python.
 
-To write a native RHS or event, subclass `OdeSystem` or `EventFunction` in a
-`.pyx` file and implement its `cdef eval`:
+### Native systems, runtime parameters and the C API
+
+A native RHS is a GIL-free C function plus a context pointer. To write one,
+subclass `OdeSystem` (or `EventFunction` for events) in a `.pyx` file. In
+`__init__`, register the C function with `c_fn` / `c_ctx` and declare the
+runtime parameters:
 
 ```cython
-cdef int eval(self, double t, const double* y, double* dydt, Py_ssize_t n) except -1   # OdeSystem
-cdef double eval(self, double t, const double* y, Py_ssize_t n) except? -1              # EventFunction
+from fast_numerical_integration.integrators cimport OdeSystem
+
+cdef int _vdp(double t, const double* y, double* dydt, Py_ssize_t n, void* ctx) noexcept nogil:
+    cdef const double* p = <const double*> ctx          # p[0] = mu
+    dydt[0] = y[1]
+    dydt[1] = p[0] * (1.0 - y[0] * y[0]) * y[1] - y[0]
+    return 0
+
+cdef class VanDerPol(OdeSystem):
+    def __init__(self, double mu=1.0):
+        self.n_states = 2
+        self._init_params([mu], ("mu",))
+        self.c_fn = _vdp
+        self.c_ctx = self._params_ptr()
 ```
 
-`nbody.pyx` is an example. The SymPy-generated C kernels in later milestones will
-plug in through the same hook.
+Parameters change between solves without recompiling, which is what
+continuation needs:
+
+```python
+vdp = VanDerPol()
+for mu in (1.0, 10.0, 100.0):
+    vdp.params = [mu]
+    sol = solve_ivp(vdp, (0, 20), [2.0, 0.0], method="DOP853")
+```
+
+(Overriding `cdef eval` still works, but such systems need the GIL.)
+
+All three entry points run on one C core, so they take bit-identical steps:
+
+| entry point | what it does |
+|---|---|
+| `solve_ivp(...)` | full SciPy-compatible API: trajectory, `t_eval`, dense output, events |
+| `integrate(...)` | endpoint + event locations only (shooting). Releases the GIL when the system and events are native, so Python threads run in parallel |
+| `fni_integrate(...)` (C) | `cimport`able from other Cython modules and callable inside `with nogil`. `batch.integrate_batch` is the reference example: it propagates many segments at ~1 µs per segment |
+
+```cython
+from fast_numerical_integration.integrators cimport (
+    fni_integrate, fni_options, fni_stats, FNI_DOP853, FNI_OK)
+
+with nogil:
+    rc = fni_integrate(FNI_DOP853, rhs_fn, ctx, n, t0, y0, t1, &opt,
+                       events, n_events, y_out, rec_event, rec_t, rec_y, max_records, &stats)
+```
+
+The lower-level `fni_solver_init` / `fni_solver_step` / `fni_solver_dense_eval` /
+`fni_events_check` functions expose single steps for custom drivers. All
+solver state lives in a caller-owned struct, so concurrent integrations are
+safe if the RHS kernels are reentrant. Every catalog kernel in
+`problems/native.pyx` is written that way.
 
 ## Quickstart
 
@@ -256,6 +305,9 @@ require before merging.
       SciPy's `solve_ivp` options for these methods.
 - [x] **Milestone 3c** — Canonical test problems (DETEST, Hairer, long-time,
       stability, events), split by oracle, with a benchmark/figure suite.
+- [x] **Milestone 3d** — GIL-free C core with a `cimport`able C API
+      (`fni_integrate`, single-step functions), runtime `params` on native
+      systems and events, `integrate()` endpoint API, `integrate_batch`.
 - [ ] **Milestone 4** — SymPy → C code printing for the RHS.
 - [ ] **Milestone 5** — Build glue that compiles the generated C into an
       `OdeSystem` subclass; benchmark against the baseline.

@@ -8,6 +8,7 @@ Tests are grouped by the oracle they check against:
 - ``long_time/`` -- conserved quantities and periodicity over long integrations
 - ``stability/`` -- stiff, unstable, chaotic and blow-up problems
 - ``events/``    -- event location on physical problems and edge cases
+- ``c_api/``     -- runtime parameters and the GIL-free C API (bit-identical to solve_ivp)
 
 Tests marked ``slow`` are skipped unless ``--runslow`` is given.
 """
