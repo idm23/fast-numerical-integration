@@ -240,6 +240,11 @@ uv run pytest --runslow     # include long integrations
 uv run pytest tests/events  # one oracle group
 ```
 
+CI (`.github/workflows/tests.yml`) runs the full suite, including
+`--runslow`, on Python 3.11, 3.12 and 3.13 for every pull request and push
+to `main`. The `all-tests` check aggregates the matrix and is the status to
+require before merging.
+
 ## Roadmap
 
 - [x] **Milestone 1** — SciPy `solve_ivp` figure-eight baseline + visualization.

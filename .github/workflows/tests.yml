@@ -1,0 +1,61 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest --runslow (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+
+      # Stock-SciPy comparisons are sensitive to the BLAS kernel NumPy picks
+      # for the CPU; log the hardware so discrepancies are diagnosable.
+      - name: Runner CPU
+        run: lscpu | grep -E "Model name|Flags" | cut -c1-200
+
+      - name: Set up uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      # Builds the Cython extensions (gcc is preinstalled on ubuntu-latest).
+      # The default x86-64 flags (no FMA contraction) are what the
+      # bit-identical parity tests assume.
+      - name: Install project and build extensions
+        run: uv sync --locked
+
+      - name: Run full test suite, including slow tests
+        run: uv run pytest --runslow -ra
+
+  # Single, stable status check to require in branch protection,
+  # independent of the Python versions in the matrix above.
+  all-tests:
+    name: all-tests
+    if: always()
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every matrix job to pass
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Test matrix result: ${{ needs.test.result }}"
+            exit 1
+          fi

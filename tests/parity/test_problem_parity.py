@@ -9,7 +9,10 @@ Two oracles:
    between our loops and NumPy/BLAS flip an accept/reject decision. SciPy is
    just as sensitive to its own rounding: a 1-ulp change to ``y0``, or the
    compiled RHS in place of the NumPy one, changes its count on the same
-   problems. For DOP853 we therefore require close agreement, not equality.
+   problems. For DOP853, and for unstable/chaotic problems with any method,
+   we therefore require close agreement, not equality. Stock SciPy's rounding
+   also depends on the BLAS kernel NumPy selects for the CPU, so the same
+   cases can come out differently on other machines (CI runners).
 
 2. **SciPy with our summation order** (the decisive check). We patch SciPy's
    ``rk_step``, error norms and RMS norm to sum in the same order as the
@@ -33,6 +36,10 @@ from fast_numerical_integration.problems import catalog
 from fast_numerical_integration.testing import scipy_with_our_summation_order
 
 METHODS = ("RK23", "RK45", "DOP853")
+# Unstable or chaotic problems: rounding differences grow exponentially, so
+# even RK23/RK45 counts against *stock* SciPy depend on the BLAS kernel NumPy
+# picks for the CPU (seen on CI runners). The matched-order test stays exact.
+ROUNDING_SENSITIVE = {"arenstorf_long", "lorenz"}
 SLOW_PROBLEMS = {"kepler_long", "outer_solar_system", "figure_eight_long", "arenstorf_long",
                  "vdp_mu1000", "linear_stiff"}
 
@@ -78,7 +85,7 @@ def test_matches_stock_scipy(problem, method):
         sol = solve_ivp(problem.native(), problem.t_span, problem.y0, **kw)
         assert sol.status == ref.status
 
-        if method == "DOP853":
+        if method == "DOP853" or problem.name in ROUNDING_SENSITIVE:
             assert sol.nfev == pytest.approx(ref.nfev, rel=0.1)
         else:
             assert sol.nfev == ref.nfev
