@@ -202,7 +202,25 @@ solver state lives in a caller-owned struct, so concurrent integrations are
 safe if the RHS kernels are reentrant. Every catalog kernel in
 `problems/native.pyx` is written that way.
 
-## Quickstart
+## Installation
+
+```bash
+pip install fast-numerical-integration            # or: uv add fast-numerical-integration
+pip install "fast-numerical-integration[plot]"    # + matplotlib, for fni / fni-suite / visualize
+```
+
+Pre-built wheels cover Linux (x86_64, aarch64), macOS (Intel, Apple Silicon)
+and Windows for CPython 3.11–3.14, so no compiler is needed. Every wheel passes
+the full test suite on its own platform before it is published. All
+extensions are built with floating-point contraction off, so results are
+identical across platforms.
+
+To `cimport` the C API from your own Cython package, add
+`fast-numerical-integration` and `cython` to your `[build-system] requires`.
+`examples/downstream/` is a minimal working package; the release workflow
+builds it against every release.
+
+## Quickstart (development)
 
 Requires [`uv`](https://docs.astral.sh/uv/).
 
@@ -312,6 +330,19 @@ require before merging.
 - [ ] **Milestone 5** — Build glue that compiles the generated C into an
       `OdeSystem` subclass; benchmark against the baseline.
 
+## Releasing
+
+Releases are published from GitHub Actions (`.github/workflows/release.yml`)
+with PyPI trusted publishing, so no tokens are stored.
+
+1. Bump `version` in `pyproject.toml` and merge the change to `main`.
+2. Optional rehearsal: run the *Release* workflow manually with
+   `target: testpypi`, then `pip install -i https://test.pypi.org/simple/
+   --extra-index-url https://pypi.org/simple/ fast-numerical-integration`.
+3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`. The workflow
+   checks that the tag matches the version, builds and tests every wheel, and
+   uploads to PyPI.
+
 ## License
 
-TBD.
+MIT. See [LICENSE](LICENSE).

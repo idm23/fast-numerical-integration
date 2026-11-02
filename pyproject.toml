@@ -1,18 +1,50 @@
 [build-system]
-requires = ["setuptools>=68", "cython>=3.0", "numpy>=2.0"]
+# setuptools >= 77 for PEP 639 license metadata (license = "MIT").
+requires = ["setuptools>=77", "cython>=3.0", "numpy>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fast-numerical-integration"
-version = "0.1.0"
-description = "A framework for fast numerical integration in Python"
+version = "0.2.0"
+description = "Fast Cython RK23/RK45/DOP853 integrators that reproduce scipy.integrate.solve_ivp step for step, with a GIL-free C API"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ian Mackey" }]
 requires-python = ">=3.11"
+keywords = ["ode", "numerical-integration", "runge-kutta", "dop853", "cython", "solve_ivp", "scipy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Cython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+# The integrators need only NumPy; SciPy backs the problem catalog, the
+# SciPy-comparison helpers and the benchmarks. Cython is build-time only
+# (downstream packages that cimport the .pxd files add it to their own
+# build requirements).
 dependencies = [
-    "cython>=3.0",
     "numpy>=2.0",
     "scipy>=1.13",
-    "matplotlib>=3.8",
 ]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8"]   # fni, fni-suite, visualize
+
+[project.urls]
+Homepage = "https://github.com/idm23/fast-numerical-integration"
+Repository = "https://github.com/idm23/fast-numerical-integration"
+Issues = "https://github.com/idm23/fast-numerical-integration/issues"
 
 [project.scripts]
 fni = "fast_numerical_integration.main:main"
@@ -22,6 +54,7 @@ fni-suite = "fast_numerical_integration.suite:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "matplotlib>=3.8",
 ]
 
 [tool.setuptools.packages.find]
@@ -45,3 +78,11 @@ addopts = "--import-mode=importlib"
 markers = [
     "slow: long-running integrations (run with --runslow)",
 ]
+
+[tool.cibuildwheel]
+# CPython 3.11-3.14 (not free-threaded); 64-bit only; manylinux (glibc) only.
+build = "cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_* *-win32 *_i686"
+# Every wheel runs the complete test suite, slow tests included, before upload.
+test-requires = ["pytest", "matplotlib"]
+test-command = "pytest {project}/tests -q --runslow -p no:cacheprovider"

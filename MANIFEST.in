@@ -1,0 +1,4 @@
+# Generated C is rebuilt from the .pyx sources at build time; never ship stale copies.
+global-exclude *.c *.so *.pyd
+recursive-include tests *.py
+include LICENSE README.md

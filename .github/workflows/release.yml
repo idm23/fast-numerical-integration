@@ -1,0 +1,148 @@
+name: Release
+
+# Builds the sdist and wheels for Linux (x86_64, aarch64), macOS (Intel, Apple
+# Silicon) and Windows, for CPython 3.11-3.14. Each wheel runs the full test
+# suite (including slow tests) inside cibuildwheel before anything is
+# published. Publishing uses PyPI trusted publishing (OIDC), so no API tokens
+# are stored.
+#
+#   pull request touching packaging -> build + test only
+#   manual run with target=testpypi -> build, test, upload to TestPyPI
+#   push of a tag vX.Y.Z            -> build, test, upload to PyPI
+#                                      (the tag must match the pyproject version)
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "setup.py"
+      - "pyproject.toml"
+      - "MANIFEST.in"
+      - ".github/workflows/release.yml"
+      - "examples/downstream/**"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target (PyPI releases happen only from tags)"
+        type: choice
+        options: [none, testpypi]
+        default: none
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check-version:
+    name: tag matches version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare tag with pyproject version
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match pyproject version ${version}"
+            exit 1
+          fi
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - name: Build sdist
+        run: uv build --sdist --out-dir dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    name: wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest      # manylinux x86_64
+          - ubuntu-24.04-arm   # manylinux aarch64
+          - macos-15-intel     # macOS x86_64
+          - macos-15           # macOS arm64 (Apple Silicon)
+          - windows-latest     # Windows AMD64
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test wheels
+        uses: pypa/cibuildwheel@v4.3.5
+        with:
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  downstream:
+    name: downstream cimport (Linux wheel)
+    needs: wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-wheels-ubuntu-latest
+          path: wheelhouse
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build an extension that cimports the installed .pxd files
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install wheelhouse/*cp312*manylinux*x86_64*.whl cython "setuptools>=77"
+          cd examples/downstream
+          python -m pip install --no-build-isolation .
+          cd /tmp && python "$GITHUB_WORKSPACE/examples/downstream/check.py"
+
+  publish-testpypi:
+    name: publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    needs: [sdist, wheels, downstream]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/fast-numerical-integration
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check-version, sdist, wheels, downstream]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fast-numerical-integration
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
