@@ -103,7 +103,7 @@ The tests are grouped by the oracle they check against:
 | `tests/accuracy/` | DETEST global error vs tolerance; observed order 3/5/8 with fixed steps; dense-output order; references cross-checked against Radau and LSODA |
 | `tests/long_time/` | Kepler: linear invariant drift and quadratic phase-error growth; two independent solar-system formulations agree; linear invariants exact to round-off |
 | `tests/stability/` | step size rides the stability boundary computed from each tableau (2.51 / 3.31 / 6.39); stiffness scaling; blow-up; Lorenz error growth at the Lyapunov rate |
-| `tests/events/` | exact event times on physical problems; edge cases (t0, t_end, simultaneous/terminal ordering, root pairs and grazing touches missed exactly as in SciPy) |
+| `tests/events/` | exact event times on physical problems; edge cases (t0, t_end, simultaneous/terminal ordering, root pairs and grazing touches missed exactly as in SciPy); crossings found by splitting a step at roots and by interior test points |
 | `tests/baseline/` | SciPy baseline, benchmark harness, suite smoke test |
 
 Findings worth knowing:
@@ -189,15 +189,17 @@ All three entry points run on one C core, so they take bit-identical steps:
 
 ```cython
 from fast_numerical_integration.integrators cimport (
-    fni_integrate, fni_options, fni_stats, FNI_DOP853, FNI_OK)
+    fni_integrate, fni_options, fni_options_init, fni_stats, FNI_DOP853, FNI_OK)
 
+fni_options_init(&opt)          # defaults first, so fields added later get defaults
+opt.rtol = 1e-10
 with nogil:
     rc = fni_integrate(FNI_DOP853, rhs_fn, ctx, n, t0, y0, t1, &opt,
                        events, n_events, y_out, rec_event, rec_t, rec_y, max_records, &stats)
 ```
 
 The lower-level `fni_solver_init` / `fni_solver_step` / `fni_solver_dense_eval` /
-`fni_events_check` / `fni_solver_restart` functions expose single steps for custom drivers. All
+`fni_events_begin` / `fni_events_next` / `fni_solver_restart` functions expose single steps for custom drivers. All
 solver state lives in a caller-owned struct, so concurrent integrations are
 safe if the RHS kernels are reentrant. Every catalog kernel in
 `problems/native.pyx` is written that way.
@@ -241,6 +243,50 @@ res.t_resets, res.y_before_resets, res.y_after_resets
   output) and `integrate_hybrid` (endpoint) take the same steps. In C,
   `fni_integrate_hybrid` runs a whole hybrid integration inside `with nogil`;
   `fni_integrate` is the same loop with no reset map.
+
+### Detecting events inside a step
+
+SciPy detects an event by comparing its sign at the two ends of each step.
+If the event crosses zero twice within one step, in and back out, the signs
+match and neither crossing is seen. That is easy to hit: away from the event
+the solution is often smooth, the solver takes long steps, and a short dip
+fits inside one.
+
+```
+ g    +          ╭──╮
+    0 ───────────┼──┼──────────
+    −   ●   ○   ○│ ○│  ○   ○   ●     ● step ends: same sign, nothing seen
+        t_a      ╰──╯          t_b   ○ interior test points: the sign change shows
+```
+
+FNI keeps SciPy's behaviour by default and adds two things:
+
+- **Every root splits the step for the other events** (always on). When one
+  event is found at `t_e`, every other event is checked at `t_e` too, so a
+  crossing on `[t_a, t_e]` that is cancelled at `t_b` is still found, and
+  roots are reported in time order. This also fixes a crossing that was
+  silently lost when a terminal event (or a guard's reset) cut the step
+  short. Without hidden crossings, the roots are SciPy's, bit for bit.
+- **`event_detection="interior"`** (opt-in) also compares signs at
+  `n_interior` evenly spaced points inside every step, on the step's
+  interpolant. It finds pairs of crossings at least `h / (n_interior + 1)`
+  apart. The cost: the interpolant is built on every step (3 extra RHS
+  evaluations per step for DOP853, free for RK23 and RK45), plus
+  `n_interior` evaluations of each event.
+
+```python
+solve_ivp(f, (0, 10), y0, events=g)                                         # SciPy's detection
+solve_ivp(f, (0, 10), y0, events=g, event_detection="interior", n_interior=8)
+```
+
+Both options work in `solve_ivp`, `solve_hybrid`, `integrate` and
+`integrate_hybrid`; in C they are fields of `fni_options`
+(`event_detection = FNI_EVENTS_INTERIOR`, `n_interior`).
+
+The splitting makes a strong guarantee possible from outside: add an event on
+the derivative of `g`. Its roots are the peaks and troughs of `g`, and `g` is
+monotone between them, so it can cross zero at most once on each piece, and
+the split finds that crossing.
 
 ## Installation
 
@@ -369,6 +415,9 @@ require before merging.
 - [x] **Milestone 3e** — Hybrid integration: guards, reset maps, modes and
       Zeno limits in the C core (`fni_integrate_hybrid`), `solve_hybrid`,
       `integrate_hybrid` (0.3.0).
+- [x] **Milestone 3f** — Event detection inside a step: roots split the step
+      for the other events, opt-in interior test points
+      (`event_detection="interior"`), `fni_options_init` (0.4.0).
 - SymPy code generation lives in the companion package
   [auto-optimal-control](https://github.com/idm23/auto-optimal-control),
   which builds its compiled kernels on this C API.
