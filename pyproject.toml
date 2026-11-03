@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fast-numerical-integration"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fast Cython RK23/RK45/DOP853 integrators that reproduce scipy.integrate.solve_ivp step for step, with a GIL-free C API"
 readme = "README.md"
 license = "MIT"

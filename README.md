@@ -197,10 +197,50 @@ with nogil:
 ```
 
 The lower-level `fni_solver_init` / `fni_solver_step` / `fni_solver_dense_eval` /
-`fni_events_check` functions expose single steps for custom drivers. All
+`fni_events_check` / `fni_solver_restart` functions expose single steps for custom drivers. All
 solver state lives in a caller-owned struct, so concurrent integrations are
 safe if the RHS kernels are reentrant. Every catalog kernel in
 `problems/native.pyx` is written that way.
+
+### Hybrid systems: guards and reset maps
+
+A hybrid system is a flow whose state jumps, or whose equations change, at
+events: impacts, contact and lift-off, stage separation, impulsive burns,
+bang-bang control switches. `solve_hybrid` and `integrate_hybrid` treat every
+**terminal** event as a *guard*. When it fires, a **reset map** takes the
+event index, time and state just before it, and returns the state just after.
+Integration then continues from the event in the same solver, with the step
+size carried over.
+
+```python
+from fast_numerical_integration.integrators import ComponentCrossing, ScaleComponent, solve_hybrid
+from fast_numerical_integration.problems.native import LinearSystem
+
+ball = LinearSystem([[0, 1], [0, 0]], [0, -9.81])        # y = [height, velocity]
+ground = ComponentCrossing(0, 0.0, terminal=True, direction=-1)
+bounce = ScaleComponent(1, -0.8)                          # v -> -0.8 v
+res = solve_hybrid(ball, (0, 3), [1.0, 0.0], ground, bounce, method="DOP853",
+                   rtol=1e-10, atol=1e-12, dense_output=True, min_dwell=1e-6)
+res.t_resets, res.y_before_resets, res.y_after_resets
+```
+
+- **Reset maps:** a Python callable `reset(event, t, y)` returns the new
+  state, or `None` to stop at the event. Subclass `ResetMap` with a `nogil`
+  `c_fn` (an `fni_reset_fn`) for speed and for GIL-free runs.
+- **Modes:** a discrete mode (which arc, which contact state) lives in a
+  context that the right-hand side and the reset map share; the reset map
+  updates it.
+- **Re-triggering:** right after a reset, the guard that fired sits on zero.
+  FNI probes it slightly later along the new flow, as SUNDIALS' root finder
+  does, so it cannot fire again on that zero, while a real crossing later in
+  the same step still fires.
+- **Zeno behaviour:** `max_resets` (status -2) and `min_dwell` (status -3,
+  two resets closer than this) end the integration cleanly instead of
+  chattering forever.
+- **Bit-identical drivers:** `solve_hybrid` (trajectory, `t_eval`, dense
+  output) and `integrate_hybrid` (endpoint) take the same steps. In C,
+  `fni_integrate_hybrid` runs a whole hybrid integration inside `with nogil`;
+  `fni_integrate` is the same loop with no reset map.
 
 ## Installation
 
@@ -326,9 +366,12 @@ require before merging.
 - [x] **Milestone 3d** — GIL-free C core with a `cimport`able C API
       (`fni_integrate`, single-step functions), runtime `params` on native
       systems and events, `integrate()` endpoint API, `integrate_batch`.
-- [ ] **Milestone 4** — SymPy → C code printing for the RHS.
-- [ ] **Milestone 5** — Build glue that compiles the generated C into an
-      `OdeSystem` subclass; benchmark against the baseline.
+- [x] **Milestone 3e** — Hybrid integration: guards, reset maps, modes and
+      Zeno limits in the C core (`fni_integrate_hybrid`), `solve_hybrid`,
+      `integrate_hybrid` (0.3.0).
+- SymPy code generation lives in the companion package
+  [auto-optimal-control](https://github.com/idm23/auto-optimal-control),
+  which builds its compiled kernels on this C API.
 
 ## Releasing
 
