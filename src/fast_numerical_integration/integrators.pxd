@@ -78,6 +78,13 @@ cdef enum:
     FNI_ERR_ROOT_CONV = -5   # event root finding did not converge
 
 cdef enum:
+    # event detection (fni_options.event_detection)
+    FNI_EVENTS_ENDPOINTS = 0  # scipy: sign test at the ends of each step; the
+                              # interpolant is built only when a sign changes
+    FNI_EVENTS_INTERIOR = 1   # also test at n_interior points inside every step,
+                              # on the interpolant (built on every step)
+
+cdef enum:
     FNI_DENSE_RK = 0         # y_old + h * sum_k Q[k] x^(k+1)
     FNI_DENSE_DOP853 = 1     # nested Hairer-Wanner form
 
@@ -105,6 +112,8 @@ cdef struct fni_options:
     const double* atol_vec   # optional, length n
     double first_step        # <= 0: choose automatically (scipy's heuristic)
     double max_step          # > 0 (INFINITY for no limit)
+    int event_detection      # FNI_EVENTS_*
+    Py_ssize_t n_interior    # FNI_EVENTS_INTERIOR: interior test points per step (>= 1)
 
 cdef struct fni_solver:
     const fni_tableau* tab
@@ -115,6 +124,8 @@ cdef struct fni_solver:
     double t_bound
     double direction
     double max_step
+    int event_detection
+    Py_ssize_t n_interior
     double t_old
     bint has_t_old
     double h_abs
@@ -143,6 +154,24 @@ cdef struct fni_event:
     double direction         # >0: increasing only, <0: decreasing only, 0: both
     double max_events        # terminate after this many occurrences (INFINITY: never)
 
+# Scratch and position of the event scan over one step (see fni_events_begin).
+cdef struct fni_event_scan:
+    Py_ssize_t n_events
+    double* mem              # single allocation backing every buffer below
+    double* ga               # per event: value at the left end ta of its search
+    double* ta
+    double* gb               # values at the current test point b
+    double* gr               # values at a candidate root
+    double* root             # per event: located root not yet reported (NaN: none)
+    double* rt               # right end of that root's bracket
+    double* rv               # value there
+    double* buf              # state scratch, length n
+    const double* g_end      # values at the end of the step
+    double a                 # scan position: every event before it is reported
+    double b                 # current test point
+    Py_ssize_t i_point       # index of b among the step's test points (1..n_points)
+    Py_ssize_t n_points
+
 cdef struct fni_hybrid_options:
     Py_ssize_t max_resets    # stop with FNI_STATUS_RESET_LIMIT beyond this many (< 0: no limit)
     double min_dwell         # stop with FNI_STATUS_ZENO if a reset follows the previous
@@ -167,6 +196,7 @@ cdef struct fni_stats:
     Py_ssize_t n_records     # events found (may exceed the record capacity)
 
 cdef const fni_tableau* fni_get_tableau(int method) noexcept nogil
+cdef void fni_options_init(fni_options* opt) noexcept nogil
 cdef int fni_solver_init(fni_solver* s, int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
                          double t0, const double* y0, double t_bound,
                          const fni_options* opt) noexcept nogil
@@ -176,17 +206,17 @@ cdef int fni_solver_ensure_dense(fni_solver* s) noexcept nogil
 cdef void fni_solver_dense_eval(const fni_solver* s, double t, double* out) noexcept nogil
 cdef int fni_events_eval(const fni_event* events, Py_ssize_t n_events, double t,
                          const double* y, Py_ssize_t n, double* g) noexcept nogil
-cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
-                          const double* g, double* g_new, double* counts,
-                          Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
-                          bint* terminate, double* buf) noexcept nogil
 cdef int fni_solver_restart(fni_solver* s, double t, const double* y,
                             bint reselect_step) noexcept nogil
-cdef int fni_events_check_masked(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
-                                 const double* g, double* g_new, double* counts,
-                                 Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
-                                 bint* terminate, double* buf,
-                                 const fni_hybrid_state* h) noexcept nogil
+cdef int fni_event_scan_init(fni_event_scan* sc, Py_ssize_t n_events,
+                             Py_ssize_t n) noexcept nogil
+cdef void fni_event_scan_free(fni_event_scan* sc) noexcept nogil
+cdef int fni_events_begin(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                          const double* g, double* g_new, const fni_hybrid_state* h,
+                          fni_event_scan* sc) noexcept nogil
+cdef int fni_events_next(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                         double* counts, const fni_hybrid_state* h, fni_event_scan* sc,
+                         Py_ssize_t* event, double* root, bint* terminal) noexcept nogil
 cdef int fni_hybrid_init(fni_hybrid_state* h, Py_ssize_t n_events) noexcept nogil
 cdef void fni_hybrid_free(fni_hybrid_state* h) noexcept nogil
 cdef void fni_hybrid_unmask(fni_hybrid_state* h, Py_ssize_t n_events,

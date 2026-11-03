@@ -7,12 +7,14 @@ span (as in multiple shooting), with one ``nogil`` loop over
 another Cython module::
 
     from fast_numerical_integration.integrators cimport (
-        fni_integrate, fni_options, fni_stats, FNI_DOP853, FNI_OK)
+        fni_integrate, fni_options, fni_options_init, fni_stats, FNI_DOP853, FNI_OK)
 
     cdef int my_rhs(double t, const double* y, double* dydt, Py_ssize_t n,
                     void* ctx) noexcept nogil:
         ...
 
+    fni_options_init(&opt)     # defaults first, then set fields
+    opt.rtol = 1e-10
     with nogil:
         rc = fni_integrate(FNI_DOP853, my_rhs, ctx, n, t0, y0, t1, &opt,
                            NULL, 0, y_out, NULL, NULL, NULL, 0, &stats)
@@ -30,6 +32,7 @@ from fast_numerical_integration.integrators cimport (
     OdeSystem,
     fni_integrate,
     fni_options,
+    fni_options_init,
     fni_rhs_fn,
     fni_stats,
 )
@@ -105,11 +108,9 @@ def integrate_batch(OdeSystem system not None, t0, t1, y0, method="DOP853", *, d
     if n == 0:
         y0_arr = np.zeros((m, 1))
 
+    fni_options_init(&opt)
     opt.rtol = rtol
-    opt.rtol_vec = NULL
     opt.atol = atol
-    opt.atol_vec = NULL
-    opt.first_step = -1.0
     opt.max_step = max_step
 
     cdef const double[::1] t0_v = t0_arr

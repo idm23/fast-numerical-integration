@@ -26,7 +26,8 @@ Cython ``eval`` overrides are reached through a trampoline that holds the GIL.
 
 Supported ``solve_ivp`` features: ``t_eval``, ``dense_output`` (returns an
 :class:`OdeSolution`), ``events`` (terminal as a bool or count, plus direction;
-roots found by Brent's method on the dense interpolant), ``vectorized``,
+roots found by Brent's method on the dense interpolant; see the event scan
+below for detection within a step), ``vectorized``,
 ``args``, ``first_step``, ``max_step``, and scalar or per-component
 ``rtol``/``atol``. Native systems and events also carry a runtime ``params``
 vector for continuation without recompiling.
@@ -40,6 +41,7 @@ from libc.math cimport fabs, sqrt, pow, nextafter, INFINITY, NAN
 from libc.stdlib cimport malloc, free
 from libc.string cimport memcpy
 
+import operator
 import warnings
 
 import numpy as np
@@ -282,6 +284,9 @@ cdef int fni_solver_init(fni_solver* s, int method, fni_rhs_fn fun, void* ctx, P
     s.mem = NULL
     if tab == NULL or n < 0 or fun == NULL or not (opt.max_step > 0):
         return FNI_ERR_ARG
+    if not (opt.event_detection == FNI_EVENTS_ENDPOINTS or (
+            opt.event_detection == FNI_EVENTS_INTERIOR and opt.n_interior >= 1)):
+        return FNI_ERR_ARG
     total = (8 + tab.n_k_rows + tab.n_dense_coef) * n
     s.mem = <double*> malloc((total if total > 0 else 1) * sizeof(double))
     if s.mem == NULL:
@@ -316,6 +321,8 @@ cdef int fni_solver_init(fni_solver* s, int method, fni_rhs_fn fun, void* ctx, P
     s.t_bound = t_bound
     s.direction = 1.0 if t_bound >= t0 else -1.0
     s.max_step = opt.max_step
+    s.event_detection = opt.event_detection
+    s.n_interior = opt.n_interior
     s.t_old = NAN
     s.has_t_old = False
     s.dense_valid = False
@@ -736,95 +743,280 @@ cdef int _brentq_event(const fni_solver* s, const fni_event* ev, double xa, doub
     return FNI_ERR_ROOT_CONV
 
 
-cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
-                          const double* g, double* g_new, double* counts,
-                          Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
-                          bint* terminate, double* buf) noexcept nogil:
-    """Detect and locate events in the step just taken (scipy's find_active_events
-    + handle_events).
+# --- event scan ----------------------------------------------------------------------
+#
+# Events are located by a scan over each accepted step, in the direction of
+# integration. The step is cut into pieces at test points: its end (and with
+# FNI_EVENTS_INTERIOR, n_interior evenly spaced points inside it, evaluated on
+# the interpolant), and at every root located in it. An event is found on a
+# piece when its sign differs between the piece's ends (scipy's test, so a
+# value of exactly zero counts as either sign). The scan reports roots one at
+# a time, earliest first. Before reporting a root it checks every other event
+# at that time, so a crossing hidden between two test points but before the
+# root (one that a later pair of crossings would cancel at the test points) is
+# found and reported first. A terminal event ends the scan, as it ends the step.
+#
+# With FNI_EVENTS_ENDPOINTS and no such hidden crossings, the roots are the
+# ones scipy finds: the same brackets and the same Brent iterations.
 
-    ``g`` holds the event values at the start of the step. ``g_new`` receives the
-    values at the end (the caller then copies them into ``g``). ``counts`` is
-    the per-event occurrence count, updated here. On return, ``found[:n_found]``
-    and ``roots[:n_found]`` list the located events in scipy's order. If
-    ``terminate`` is set, the last of them is the terminal one. Events after it
-    in the step are dropped and not counted. ``buf`` is scratch of length ``n``.
-    """
-    return fni_events_check_masked(s, events, n_events, g, g_new, counts, found, roots,
-                                   n_found, terminate, buf, NULL)
+cdef int REFINE_MAXITER = 64
 
 
-cdef int fni_events_check_masked(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
-                                 const double* g, double* g_new, double* counts,
-                                 Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
-                                 bint* terminate, double* buf,
-                                 const fni_hybrid_state* h) noexcept nogil:
-    """:func:`fni_events_check` with a hybrid integration's guard state ``h``
-    (may be NULL): masked events are ignored, and the root search of an event
-    probed after its reset starts at the probe time."""
-    cdef Py_ssize_t e, k, j, idx, cut, n_active = 0
-    cdef double tmp_r, xa, tp
-    cdef double t_old = s.t_old, t = s.t
-    cdef bint up, down, term = False
+cdef inline bint _crosses(double ga, double gb, double direction) noexcept nogil:
+    cdef bint up = ga <= 0 and gb >= 0
+    cdef bint down = ga >= 0 and gb <= 0
+    return (up and direction > 0) or (down and direction < 0) or ((up or down)
+                                                                   and direction == 0)
+
+
+cdef inline bint _before(double x, double y, double direction) noexcept nogil:
+    """``x`` comes strictly before ``y`` in the direction of integration."""
+    return (y - x) * direction > 0
+
+
+cdef void fni_options_init(fni_options* opt) noexcept nogil:
+    """Fill ``opt`` with the defaults of :func:`solve_ivp` (rtol 1e-3, atol 1e-6,
+    automatic first step, no step limit, endpoint event detection). Call it
+    before setting fields, so fields added in later versions get defaults."""
+    opt.rtol = 1e-3
+    opt.rtol_vec = NULL
+    opt.atol = 1e-6
+    opt.atol_vec = NULL
+    opt.first_step = -1.0
+    opt.max_step = INFINITY
+    opt.event_detection = FNI_EVENTS_ENDPOINTS
+    opt.n_interior = 4
+
+
+cdef int fni_event_scan_init(fni_event_scan* sc, Py_ssize_t n_events,
+                             Py_ssize_t n) noexcept nogil:
+    """Allocate the scan scratch; call :func:`fni_event_scan_free` afterwards."""
+    cdef Py_ssize_t m = n_events if n_events > 0 else 1
+    sc.n_events = n_events
+    sc.mem = <double*> malloc((7 * m + (n if n > 0 else 1)) * sizeof(double))
+    if sc.mem == NULL:
+        return FNI_ERR_ALLOC
+    sc.ga = sc.mem
+    sc.ta = sc.ga + m
+    sc.gb = sc.ta + m
+    sc.gr = sc.gb + m
+    sc.root = sc.gr + m
+    sc.rt = sc.root + m
+    sc.rv = sc.rt + m
+    sc.buf = sc.rv + m
+    sc.g_end = NULL
+    sc.i_point = 0
+    sc.n_points = 0
+    return FNI_OK
+
+
+cdef void fni_event_scan_free(fni_event_scan* sc) noexcept nogil:
+    if sc.mem != NULL:
+        free(sc.mem)
+    sc.mem = NULL
+
+
+cdef int _scan_bracket(fni_solver* s, const fni_event* events, Py_ssize_t e,
+                       fni_event_scan* sc) noexcept nogil:
+    """Locate event ``e`` on [ta, b] if its sign changes there."""
     cdef int rc
-
-    n_found[0] = 0
-    terminate[0] = False
-    rc = fni_events_eval(events, n_events, s.t, s.y, s.n, g_new)
-    if rc != FNI_OK:
-        return rc
-    for e in range(n_events):
-        if h != NULL and h.masked[e]:
-            continue
-        up = g[e] <= 0 and g_new[e] >= 0
-        down = g[e] >= 0 and g_new[e] <= 0
-        if ((up and events[e].direction > 0) or (down and events[e].direction < 0)
-                or ((up or down) and events[e].direction == 0)):
-            found[n_active] = e
-            n_active += 1
-    if n_active == 0:
+    if not (_before(sc.ta[e], sc.b, s.direction)
+            and _crosses(sc.ga[e], sc.gb[e], events[e].direction)):
         return FNI_OK
-
     rc = fni_solver_ensure_dense(s)
     if rc != FNI_OK:
         return rc
-    for k in range(n_active):
-        e = found[k]
-        xa = t_old
+    rc = _brentq_event(s, &events[e], sc.ta[e], sc.b, sc.buf, &sc.root[e])
+    if rc != FNI_OK:
+        return rc
+    sc.rt[e] = sc.b
+    sc.rv[e] = sc.gb[e]
+    return FNI_OK
+
+
+cdef int _scan_step_off_zero(fni_solver* s, const fni_event* ev, Py_ssize_t e,
+                             fni_event_scan* sc) noexcept nogil:
+    """Move event ``e``'s search start from a zero at ta (inside the step) to
+    just after it: a thousand ulps of the time scale, as the post-reset probe.
+    If it is still zero there, the event is not searched again in this step."""
+    cdef double delta = 1000 * EPS * (fabs(sc.ta[e]) + fabs(s.t - s.t_old)) * s.direction
+    cdef double tp = sc.ta[e] + delta
+    if _before(tp, s.t, s.direction):
+        fni_solver_dense_eval(s, tp, sc.buf)
+        if ev.fn(tp, sc.buf, s.n, ev.ctx, &sc.ga[e]) != 0:
+            return FNI_ERR_CALLBACK
+        sc.ta[e] = tp
+        if sc.ga[e] != 0:
+            return FNI_OK
+    sc.ga[e] = sc.g_end[e]
+    sc.ta[e] = s.t
+    return FNI_OK
+
+
+cdef int _scan_load(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                    const fni_hybrid_state* h, fni_event_scan* sc) noexcept nogil:
+    """Move to the next test point and locate the events that change sign
+    between the scan position and it."""
+    cdef Py_ssize_t e
+    cdef int rc
+    sc.i_point += 1
+    if sc.i_point == sc.n_points:
+        sc.b = s.t
+        memcpy(sc.gb, sc.g_end, n_events * sizeof(double))
+    else:
+        rc = fni_solver_ensure_dense(s)
+        if rc != FNI_OK:
+            return rc
+        sc.b = s.t_old + (s.t - s.t_old) * (<double> sc.i_point / <double> sc.n_points)
+        fni_solver_dense_eval(s, sc.b, sc.buf)
+        rc = fni_events_eval(events, n_events, sc.b, sc.buf, s.n, sc.gb)
+        if rc != FNI_OK:
+            return rc
+    for e in range(n_events):
+        if (h != NULL and h.masked[e]) or sc.root[e] == sc.root[e]:
+            continue
+        rc = _scan_bracket(s, events, e, sc)
+        if rc != FNI_OK:
+            return rc
+    return FNI_OK
+
+
+cdef int fni_events_begin(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                          const double* g, double* g_new, const fni_hybrid_state* h,
+                          fni_event_scan* sc) noexcept nogil:
+    """Start the event scan of the step just taken; report its events with
+    :func:`fni_events_next`.
+
+    ``g`` holds the event values at the start of the step and ``g_new``
+    receives the values at its end (the caller then copies them into ``g``).
+    ``h`` is a hybrid integration's guard state (may be NULL): masked events
+    are ignored, and the search for an event probed after its reset starts at
+    the probe time. ``sc`` comes from :func:`fni_event_scan_init`.
+    """
+    cdef Py_ssize_t e
+    cdef double tp, t_old = s.t_old, t = s.t
+    cdef int rc
+    rc = fni_events_eval(events, n_events, t, s.y, s.n, g_new)
+    if rc != FNI_OK:
+        return rc
+    sc.g_end = g_new
+    sc.a = t_old
+    for e in range(n_events):
+        sc.ga[e] = g[e]
+        sc.ta[e] = t_old
+        sc.root[e] = NAN
         if h != NULL:
             tp = h.t_probe[e]
             if (tp > t_old and tp < t) or (tp < t_old and tp > t):
-                xa = tp
-        rc = _brentq_event(s, &events[e], xa, t, buf, &roots[k])
+                sc.ta[e] = tp
+    sc.n_points = (s.n_interior + 1 if s.event_detection == FNI_EVENTS_INTERIOR
+                   and n_events > 0 else 1)
+    sc.i_point = 0
+    return _scan_load(s, events, n_events, h, sc)
+
+
+cdef int fni_events_next(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                         double* counts, const fni_hybrid_state* h, fni_event_scan* sc,
+                         Py_ssize_t* event, double* root, bint* terminal) noexcept nogil:
+    """Report the next event of the step: its index in ``event`` (-1 when the
+    step has no more) and its time in ``root``.
+
+    ``counts`` holds the occurrences per event and is updated here.
+    ``terminal`` is set when this occurrence reaches the event's
+    ``max_events``; the step then ends at ``root`` and the scan must not be
+    continued. Events at the same time are reported in index order.
+    """
+    cdef Py_ssize_t e, best, it = 0
+    cdef double r, c
+    cdef double dirn = s.direction
+    cdef bint improved
+    cdef int rc
+
+    event[0] = -1
+    terminal[0] = False
+    while True:
+        best = -1
+        for e in range(n_events):
+            if sc.root[e] == sc.root[e] and (best < 0
+                                             or _before(sc.root[e], sc.root[best], dirn)):
+                best = e
+        if best < 0:
+            if sc.i_point >= sc.n_points:
+                return FNI_OK
+            # Nothing left before b: move the scan position there.
+            for e in range(n_events):
+                if not _before(sc.b, sc.ta[e], dirn):
+                    sc.ga[e] = sc.gb[e]
+                    sc.ta[e] = sc.b
+            sc.a = sc.b
+            rc = _scan_load(s, events, n_events, h, sc)
+            if rc != FNI_OK:
+                return rc
+            continue
+
+        r = sc.root[best]
+        if not _before(sc.a, r, dirn):
+            memcpy(sc.gr, sc.ga, n_events * sizeof(double))
+            break
+        # Any other event whose sign differs between its search start and r
+        # crosses before r (or at it): locate it and take the earliest.
+        fni_solver_dense_eval(s, r, sc.buf)
+        rc = fni_events_eval(events, n_events, r, sc.buf, s.n, sc.gr)
         if rc != FNI_OK:
             return rc
-        if counts[e] + 1 >= events[e].max_events:
-            term = True
+        improved = False
+        for e in range(n_events):
+            if e == best or (h != NULL and h.masked[e]):
+                continue
+            if not (_before(sc.ta[e], r, dirn) and _crosses(sc.ga[e], sc.gr[e],
+                                                             events[e].direction)):
+                continue
+            if sc.root[e] == sc.root[e] and not _before(r, sc.root[e], dirn):
+                continue      # already located at or before r
+            rc = _brentq_event(s, &events[e], sc.ta[e], r, sc.buf, &c)
+            if rc != FNI_OK:
+                return rc
+            sc.root[e] = c
+            sc.rt[e] = r
+            sc.rv[e] = sc.gr[e]
+            improved = True
+        it += 1
+        if improved and it < REFINE_MAXITER:
+            continue          # an earlier root was found: check before it
+        break
 
-    if term:
-        # Stable sort (found, roots) in the direction of integration, then keep
-        # events up to and including the first terminal one.
-        for k in range(1, n_active):
-            tmp_r = roots[k]
-            idx = found[k]
-            j = k - 1
-            while j >= 0 and ((roots[j] > tmp_r) if t > t_old else (roots[j] < tmp_r)):
-                roots[j + 1] = roots[j]
-                found[j + 1] = found[j]
-                j -= 1
-            roots[j + 1] = tmp_r
-            found[j + 1] = idx
-        cut = n_active
-        for k in range(n_active):
-            if counts[found[k]] + 1 >= events[found[k]].max_events:
-                cut = k + 1
-                break
-        n_active = cut
+    # Report ``best`` at r. Every other event's search now starts at r (unless
+    # it starts later, at a probe), and ``best`` resumes from the right end of
+    # its bracket, where its sign is known: a further crossing beyond it in
+    # this piece is located now.
+    for e in range(n_events):
+        if e != best and not _before(r, sc.ta[e], dirn):
+            sc.ga[e] = sc.gr[e]
+            sc.ta[e] = r
+    sc.ga[best] = sc.rv[best]
+    sc.ta[best] = sc.rt[best]
+    sc.root[best] = NAN
+    sc.a = r
+    if sc.rv[best] == 0 and sc.rt[best] != s.t:
+        # The root sits exactly on its bracket's right end, inside the step
+        # (a test point, or another event's root): the zero there must not
+        # count as a second crossing, so search on from just after it.
+        rc = _scan_step_off_zero(s, &events[best], best, sc)
+        if rc != FNI_OK:
+            return rc
+    # Look again for crossings on [ta, b]: ``best`` from the end of its
+    # bracket, and events whose sign changed at r in the direction they ignore.
+    for e in range(n_events):
+        if (h != NULL and h.masked[e]) or sc.root[e] == sc.root[e]:
+            continue
+        rc = _scan_bracket(s, events, e, sc)
+        if rc != FNI_OK:
+            return rc
 
-    for k in range(n_active):
-        counts[found[k]] += 1
-    n_found[0] = n_active
-    terminate[0] = term
+    counts[best] += 1
+    event[0] = best
+    root[0] = r
+    terminal[0] = counts[best] >= events[best].max_events
     return FNI_OK
 
 
@@ -965,19 +1157,17 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
     """
     cdef fni_solver s
     cdef fni_hybrid_state h
-    cdef Py_ssize_t k, e, n_found, last = -1
+    cdef fni_event_scan scan
+    cdef Py_ssize_t e, e_found = -1, last = -1
     cdef bint terminate
     cdef double* work = NULL
     cdef double* g
     cdef double* g_new
     cdef double* counts
-    cdef double* roots
-    cdef double* buf
     cdef double* y_event
     cdef double* tmp
-    cdef Py_ssize_t* found = NULL
     cdef int rc, hstatus
-    cdef double t_event
+    cdef double t_event = NAN
 
     stats.status = FNI_STATUS_FAILED
     stats.t_final = t0
@@ -989,26 +1179,27 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
         n_resets[0] = 0
     h.masked = NULL
     h.t_probe = NULL
+    scan.mem = NULL
 
     rc = fni_solver_init(&s, method, fun, ctx, n, t0, y0, t1, opt)
     if rc == FNI_OK:
         rc = fni_hybrid_init(&h, n_events)
+    if rc == FNI_OK:
+        rc = fni_event_scan_init(&scan, n_events, n)
     if rc != FNI_OK:
         fni_solver_free(&s)
         fni_hybrid_free(&h)
+        fni_event_scan_free(&scan)
         return rc
 
-    work = <double*> malloc((4 * n_events + 2 * (n if n > 0 else 1) + 1) * sizeof(double))
-    found = <Py_ssize_t*> malloc((n_events if n_events > 0 else 1) * sizeof(Py_ssize_t))
-    if work == NULL or found == NULL:
+    work = <double*> malloc((3 * n_events + (n if n > 0 else 1) + 1) * sizeof(double))
+    if work == NULL:
         rc = FNI_ERR_ALLOC
     else:
         g = work
         g_new = g + n_events
         counts = g_new + n_events
-        roots = counts + n_events
-        buf = roots + n_events
-        y_event = buf + (n if n > 0 else 1)
+        y_event = counts + n_events
         for e in range(n_events):
             counts[e] = 0.0
         rc = fni_events_eval(events, n_events, t0, s.y, n, g)
@@ -1024,30 +1215,33 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
             break
 
         terminate = False
-        n_found = 0
         if n_events > 0:
-            rc = fni_events_check_masked(&s, events, n_events, g, g_new, counts, found, roots,
-                                         &n_found, &terminate, buf, &h)
-            if rc != FNI_OK:
-                break
-            for k in range(n_found):
+            rc = fni_events_begin(&s, events, n_events, g, g_new, &h, &scan)
+            while rc == FNI_OK:
+                rc = fni_events_next(&s, events, n_events, counts, &h, &scan, &e_found,
+                                     &t_event, &terminate)
+                if rc != FNI_OK or e_found < 0:
+                    break
                 if stats.n_records < max_records:
-                    record_event[stats.n_records] = found[k]
-                    record_t[stats.n_records] = roots[k]
+                    record_event[stats.n_records] = e_found
+                    record_t[stats.n_records] = t_event
                     if record_y != NULL:
-                        fni_solver_dense_eval(&s, roots[k], record_y + stats.n_records * n)
+                        fni_solver_dense_eval(&s, t_event, record_y + stats.n_records * n)
                     if record_y_after != NULL:
-                        fni_solver_dense_eval(&s, roots[k],
+                        fni_solver_dense_eval(&s, t_event,
                                               record_y_after + stats.n_records * n)
                     if record_reset != NULL:
                         record_reset[stats.n_records] = False
                     last = stats.n_records
                 stats.n_records += 1
+                if terminate:
+                    break
+            if rc != FNI_OK:
+                break
 
         if terminate:
-            t_event = roots[n_found - 1]
             fni_solver_dense_eval(&s, t_event, y_event)
-            rc = fni_hybrid_reset(&s, &h, hopt, events, n_events, counts, found[n_found - 1],
+            rc = fni_hybrid_reset(&s, &h, hopt, events, n_events, counts, e_found,
                                   t_event, y_event, reset, reset_ctx, g, &hstatus)
             if rc != FNI_OK:
                 break
@@ -1082,10 +1276,9 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
         n_resets[0] = h.n_resets
     fni_solver_free(&s)
     fni_hybrid_free(&h)
+    fni_event_scan_free(&scan)
     if work != NULL:
         free(work)
-    if found != NULL:
-        free(found)
     return rc
 
 
@@ -1770,7 +1963,7 @@ cdef class RungeKutta:
 
     def __init__(self, fun, double t0, y0, double t_bound, double max_step=INFINITY,
                  rtol=1e-3, atol=1e-6, vectorized=False, first_step=None,
-                 **extraneous):
+                 event_detection="endpoints", n_interior=4, **extraneous):
         cdef fni_options opt
         cdef double[::1] y0_view, rtol_view, atol_view
         cdef void* ctx
@@ -1779,6 +1972,7 @@ cdef class RungeKutta:
 
         _warn_extraneous(extraneous)
         self._init_tableau()
+        detection, n_int = _event_detection(event_detection, n_interior)
 
         if isinstance(fun, OdeSystem):
             system = <OdeSystem> fun
@@ -1829,12 +2023,13 @@ cdef class RungeKutta:
         y0_view = y0_b
         rtol_view = rtol_b
         atol_view = atol_b
-        opt.rtol = 0.0
+        fni_options_init(&opt)
         opt.rtol_vec = &rtol_view[0]
-        opt.atol = 0.0
         opt.atol_vec = &atol_view[0]
         opt.first_step = first
         opt.max_step = max_step
+        opt.event_detection = detection
+        opt.n_interior = n_int
 
         self.system = system
         self.message = None
@@ -2085,7 +2280,7 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
     cdef bint has_t_eval = t_eval_obj is not None
     cdef bint is_hybrid = hybrid is not None
     cdef const double[::1] t_eval
-    cdef Py_ssize_t t_eval_i_new, j, k, e, idx, n_found
+    cdef Py_ssize_t t_eval_i_new, j, k, e, idx, e_found
     cdef int status = 2   # 2 = still running
     cdef int hstatus
     cdef double t_old, t, root
@@ -2094,6 +2289,7 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
     cdef bint terminate, reset_done, reset_called
     cdef fni_hybrid_options hopt
     cdef fni_hybrid_state hst
+    cdef fni_event_scan scan
     cdef fni_reset_fn reset_fn = NULL
     cdef void* reset_ctx = NULL
 
@@ -2119,8 +2315,6 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
     cdef double[::1] g = _empty1d(max(n_events, 1))
     cdef double[::1] g_new = _empty1d(max(n_events, 1))
     cdef double[::1] counts = np.zeros(max(n_events, 1))
-    cdef double[::1] roots = _empty1d(max(n_events, 1))
-    cdef Py_ssize_t[::1] found = np.empty(max(n_events, 1), dtype=np.intp)
     t_events = [[] for _ in range(n_events)]
     y_events = [[] for _ in range(n_events)]
     reset_t, reset_e, reset_before, reset_after = [], [], [], []
@@ -2129,6 +2323,8 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
 
     hst.masked = NULL
     hst.t_probe = NULL
+    scan.mem = NULL
+    _check(fni_event_scan_init(&scan, n_events, n))
     if is_hybrid:
         hopt.max_resets = hybrid["max_resets"]
         hopt.min_dwell = hybrid["min_dwell"]
@@ -2163,19 +2359,21 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
                     memcpy(seg_row + 2 + n, s.dense, ncoef * n * sizeof(double))
 
             if n_events > 0:
-                _check(fni_events_check_masked(s, events.ev, n_events, &g[0], &g_new[0],
-                                               &counts[0], &found[0], &roots[0], &n_found,
-                                               &terminate, &buf[0],
-                                               &hst if is_hybrid else NULL))
-                for k in range(n_found):
-                    e = found[k]
-                    root = roots[k]
-                    t_events[e].append(root)
+                _check(fni_events_begin(s, events.ev, n_events, &g[0], &g_new[0],
+                                        &hst if is_hybrid else NULL, &scan))
+                terminate = False
+                while not terminate:
+                    _check(fni_events_next(s, events.ev, n_events, &counts[0],
+                                           &hst if is_hybrid else NULL, &scan, &e_found,
+                                           &root, &terminate))
+                    if e_found < 0:
+                        break
+                    t_events[e_found].append(root)
                     fni_solver_dense_eval(s, root, &buf[0])
-                    y_events[e].append(_array_from(&buf[0], n))
+                    y_events[e_found].append(_array_from(&buf[0], n))
                 if terminate:
                     status = 1
-                    t = roots[n_found - 1]
+                    t = root
                     fni_solver_dense_eval(s, t, &y_term[0])
                     y_ptr = &y_term[0]
                     if is_hybrid:
@@ -2186,14 +2384,14 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
                         if has_t_eval:
                             _take_t_eval(s, t_eval, &t_eval_i, t, traj, n)
                         _check(fni_hybrid_reset(s, &hst, &hopt, events.ev, n_events,
-                                                &counts[0], found[n_found - 1], t,
+                                                &counts[0], e_found, t,
                                                 &y_term[0], reset_fn, reset_ctx, &g[0],
                                                 &hstatus))
                         reset_called = reset_fn != NULL and (hstatus == 2
                                                              or hstatus == FNI_STATUS_EVENT)
                         if reset_called:
                             reset_t.append(t)
-                            reset_e.append(found[n_found - 1])
+                            reset_e.append(e_found)
                             reset_before.append(_array_from(&y_minus[0], n))
                             reset_after.append(_array_from(&y_term[0], n))
                         status = 2 if hstatus == 2 else hstatus
@@ -2232,6 +2430,7 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
                     bounds.push(t)
     finally:
         fni_hybrid_free(&hst)
+        fni_event_scan_free(&scan)
 
     message = MESSAGES.get(status, solver.message)
 
@@ -2288,6 +2487,19 @@ cdef int _take_t_eval(fni_solver* s, const double[::1] t_eval, Py_ssize_t* t_eva
                     fni_solver_dense_eval(s, t_eval[j], &traj.r[idx, 0])
             t_eval_i[0] = t_eval_i_new
     return 0
+
+
+_EVENT_DETECTION = {"endpoints": FNI_EVENTS_ENDPOINTS, "interior": FNI_EVENTS_INTERIOR}
+
+
+def _event_detection(event_detection, n_interior):
+    """Validate the event detection options; return (mode id, n_interior)."""
+    if event_detection not in _EVENT_DETECTION:
+        raise ValueError(f"`event_detection` must be one of {list(_EVENT_DETECTION)}.")
+    n_interior = operator.index(n_interior)
+    if n_interior < 1:
+        raise ValueError("`n_interior` must be at least 1.")
+    return _EVENT_DETECTION[event_detection], n_interior
 
 
 def _resolve_method(method):
@@ -2353,7 +2565,26 @@ def solve_ivp(fun, t_span, y0, method="RK45", t_eval=None, dense_output=False,
         systems take runtime parameters through ``system.params`` instead.
     **options
         ``first_step``, ``max_step``, ``rtol``, ``atol`` (scalar or per
-        component). Unknown options trigger a warning, as in scipy.
+        component). Unknown options trigger a warning, as in scipy. Two
+        options go beyond scipy:
+
+        ``event_detection`` : {'endpoints', 'interior'}
+            How a crossing is detected within a step. ``'endpoints'`` (the
+            default) does as scipy does: it compares each event's sign at the
+            two ends of the step, so a pair of crossings inside one step
+            (in and back out) goes unseen. ``'interior'`` also compares the
+            signs at ``n_interior`` evenly spaced points inside every step,
+            evaluated on the step's interpolant. It catches pairs of
+            crossings at least ``h / (n_interior + 1)`` apart, at the cost of
+            building the interpolant on every step (3 extra RHS evaluations
+            per step for DOP853, none for RK23 and RK45) and ``n_interior``
+            event evaluations.
+        ``n_interior`` : int
+            Interior test points per step for ``'interior'`` (default 4).
+
+        In both modes, every root located in a step splits it for the other
+        events: an event that crosses and crosses back around another
+        event's root is found too, and roots are reported in time order.
 
     Returns
     -------
@@ -2485,7 +2716,8 @@ def solve_hybrid(fun, t_span, y0, events, reset, method="RK45", t_eval=None,
 # =============================================================================
 
 def integrate(fun, t_span, y0, method="RK45", *, rtol=1e-3, atol=1e-6, first_step=None,
-              max_step=np.inf, events=None, args=None, max_records=1024, release_gil=None):
+              max_step=np.inf, events=None, args=None, max_records=1024, release_gil=None,
+              event_detection="endpoints", n_interior=4):
     """Integrate to the end of ``t_span`` (or a terminal event) via ``fni_integrate``.
 
     The lean counterpart to :func:`solve_ivp` for when only the endpoint (and
@@ -2496,6 +2728,7 @@ def integrate(fun, t_span, y0, method="RK45", *, rtol=1e-3, atol=1e-6, first_ste
     the whole integration runs without the GIL, so Python threads calling
     ``integrate`` run in parallel. ``release_gil=True`` demands that (raising if
     impossible), ``False`` keeps the GIL, and ``None`` decides automatically.
+    ``event_detection`` and ``n_interior`` are as in :func:`solve_ivp`.
 
     Returns
     -------
@@ -2507,13 +2740,13 @@ def integrate(fun, t_span, y0, method="RK45", *, rtol=1e-3, atol=1e-6, first_ste
         ``max_records``) and ``gil_released``.
     """
     return _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events, args,
-                      max_records, release_gil, None, None)
+                      max_records, release_gil, None, None, event_detection, n_interior)
 
 
 def integrate_hybrid(fun, t_span, y0, events, reset, method="RK45", *, rtol=1e-3, atol=1e-6,
                      first_step=None, max_step=np.inf, args=None, max_resets=10000,
                      min_dwell=0.0, reselect_step=False, max_records=1024,
-                     release_gil=None):
+                     release_gil=None, event_detection="endpoints", n_interior=4):
     """Integrate a hybrid system to the end of ``t_span`` via ``fni_integrate_hybrid``.
 
     The endpoint counterpart of :func:`solve_hybrid` (guards, reset maps and
@@ -2531,11 +2764,13 @@ def integrate_hybrid(fun, t_span, y0, events, reset, method="RK45", *, rtol=1e-3
     """
     return _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events, args,
                       max_records, release_gil, reset,
-                      _hybrid_options(max_resets, min_dwell, reselect_step))
+                      _hybrid_options(max_resets, min_dwell, reselect_step), event_detection,
+                      n_interior)
 
 
 cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events,
-                       args, max_records, release_gil, reset, hybrid):
+                       args, max_records, release_gil, reset, hybrid, event_detection,
+                       n_interior):
     cdef fni_options opt
     cdef fni_hybrid_options hopt
     cdef fni_reset_fn reset_fn = NULL
@@ -2584,12 +2819,12 @@ cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step
     atol_view = np.array(np.broadcast_to(atol_arr, (max(n, 1),)), dtype=np.float64)
     y0_view = y0_arr if n > 0 else np.zeros(1)
     y_out = np.zeros(max(n, 1))
-    opt.rtol = 0.0
+    fni_options_init(&opt)
     opt.rtol_vec = &rtol_view[0]
-    opt.atol = 0.0
     opt.atol_vec = &atol_view[0]
     opt.first_step = -1.0 if first_step is None else float(first_step)
     opt.max_step = max_step
+    opt.event_detection, opt.n_interior = _event_detection(event_detection, n_interior)
 
     event_list, max_events, _ = _prepare_events(events, args)
     ev_array = _EventArray(event_list, max_events, n)
