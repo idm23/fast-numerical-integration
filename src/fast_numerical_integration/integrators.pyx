@@ -61,6 +61,8 @@ _STATUS_NAMES = {FNI_RUNNING: "running", FNI_FINISHED: "finished", FNI_FAILED: "
 MESSAGES = {
     0: "The solver successfully reached the end of the integration interval.",
     1: "A termination event occurred.",
+    -2: "Reset limit reached: more than `max_resets` resets.",
+    -3: "Zeno behaviour: two resets closer together than `min_dwell`.",
 }
 MSG_TOO_SMALL_STEP = "Required step size is less than spacing between numbers."
 
@@ -343,6 +345,35 @@ cdef void fni_solver_free(fni_solver* s) noexcept nogil:
     if s.mem != NULL:
         free(s.mem)
     s.mem = NULL
+
+
+cdef int fni_solver_restart(fni_solver* s, double t, const double* y,
+                            bint reselect_step) noexcept nogil:
+    """Continue a running solver from a new point (t, y), e.g. after a reset map.
+
+    Discards the last step and its dense output, then re-evaluates f(t, y).
+    The derivative is discontinuous across a reset, so the FSAL value cannot
+    be reused. The next step starts from the controller's current step-size
+    proposal, or from the initial-step heuristic if ``reselect_step``.
+    Statistics (nfev, step counts) accumulate.
+    """
+    cdef int rc
+    if s.direction * (t - s.t_bound) > 0:
+        return FNI_ERR_ARG
+    memcpy(s.y, y, s.n * sizeof(double))
+    s.t = t
+    s.t_old = NAN
+    s.has_t_old = False
+    s.dense_valid = False
+    s.status = FNI_RUNNING
+    if s.n == 0:
+        return FNI_OK
+    rc = _fun(s, s.t, s.y, s.f)
+    if rc != FNI_OK:
+        return rc
+    if reselect_step and s.t != s.t_bound:
+        return _select_initial_step(s, &s.h_abs)
+    return FNI_OK
 
 
 cdef int _rk_stages(fni_solver* s, double h) noexcept nogil:
@@ -716,11 +747,23 @@ cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_e
     values at the end (the caller then copies them into ``g``). ``counts`` is
     the per-event occurrence count, updated here. On return, ``found[:n_found]``
     and ``roots[:n_found]`` list the located events in scipy's order. If
-    ``terminate`` is set, the last of them is the terminal one. ``buf`` is
-    scratch of length ``n``.
+    ``terminate`` is set, the last of them is the terminal one. Events after it
+    in the step are dropped and not counted. ``buf`` is scratch of length ``n``.
     """
+    return fni_events_check_masked(s, events, n_events, g, g_new, counts, found, roots,
+                                   n_found, terminate, buf, NULL)
+
+
+cdef int fni_events_check_masked(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                                 const double* g, double* g_new, double* counts,
+                                 Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
+                                 bint* terminate, double* buf,
+                                 const fni_hybrid_state* h) noexcept nogil:
+    """:func:`fni_events_check` with a hybrid integration's guard state ``h``
+    (may be NULL): masked events are ignored, and the root search of an event
+    probed after its reset starts at the probe time."""
     cdef Py_ssize_t e, k, j, idx, cut, n_active = 0
-    cdef double tmp_r
+    cdef double tmp_r, xa, tp
     cdef double t_old = s.t_old, t = s.t
     cdef bint up, down, term = False
     cdef int rc
@@ -731,6 +774,8 @@ cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_e
     if rc != FNI_OK:
         return rc
     for e in range(n_events):
+        if h != NULL and h.masked[e]:
+            continue
         up = g[e] <= 0 and g_new[e] >= 0
         down = g[e] >= 0 and g_new[e] <= 0
         if ((up and events[e].direction > 0) or (down and events[e].direction < 0)
@@ -745,11 +790,15 @@ cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_e
         return rc
     for k in range(n_active):
         e = found[k]
-        counts[e] += 1
-        rc = _brentq_event(s, &events[e], t_old, t, buf, &roots[k])
+        xa = t_old
+        if h != NULL:
+            tp = h.t_probe[e]
+            if (tp > t_old and tp < t) or (tp < t_old and tp > t):
+                xa = tp
+        rc = _brentq_event(s, &events[e], xa, t, buf, &roots[k])
         if rc != FNI_OK:
             return rc
-        if counts[e] >= events[e].max_events:
+        if counts[e] + 1 >= events[e].max_events:
             term = True
 
     if term:
@@ -767,14 +816,277 @@ cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_e
             found[j + 1] = idx
         cut = n_active
         for k in range(n_active):
-            if counts[found[k]] >= events[found[k]].max_events:
+            if counts[found[k]] + 1 >= events[found[k]].max_events:
                 cut = k + 1
                 break
         n_active = cut
 
+    for k in range(n_active):
+        counts[found[k]] += 1
     n_found[0] = n_active
     terminate[0] = term
     return FNI_OK
+
+
+# --- hybrid integration --------------------------------------------------------------
+
+cdef int fni_hybrid_init(fni_hybrid_state* h, Py_ssize_t n_events) noexcept nogil:
+    """Set up guard bookkeeping; call :func:`fni_hybrid_free` afterwards."""
+    cdef Py_ssize_t e
+    h.n_resets = 0
+    h.last_reset_t = NAN
+    h.masked = <bint*> malloc((n_events if n_events > 0 else 1) * sizeof(bint))
+    h.t_probe = <double*> malloc((n_events if n_events > 0 else 1) * sizeof(double))
+    if h.masked == NULL or h.t_probe == NULL:
+        return FNI_ERR_ALLOC
+    for e in range(n_events):
+        h.masked[e] = False
+        h.t_probe[e] = NAN
+    return FNI_OK
+
+
+cdef void fni_hybrid_free(fni_hybrid_state* h) noexcept nogil:
+    if h.masked != NULL:
+        free(h.masked)
+    if h.t_probe != NULL:
+        free(h.t_probe)
+    h.masked = NULL
+    h.t_probe = NULL
+
+
+cdef void fni_hybrid_unmask(fni_hybrid_state* h, Py_ssize_t n_events,
+                            const double* g_new) noexcept nogil:
+    """After an accepted step without a reset: re-arm each masked guard whose
+    value at the end of the step is nonzero, and forget the probe times."""
+    cdef Py_ssize_t e
+    for e in range(n_events):
+        if h.masked[e] and g_new[e] != 0:
+            h.masked[e] = False
+        h.t_probe[e] = NAN
+
+
+cdef int fni_hybrid_reset(fni_solver* s, fni_hybrid_state* h, const fni_hybrid_options* hopt,
+                          const fni_event* events, Py_ssize_t n_events, double* counts,
+                          Py_ssize_t event, double t_event, double* y,
+                          fni_reset_fn reset, void* reset_ctx, double* g,
+                          int* status) noexcept nogil:
+    """Handle terminal event ``event`` located at ``t_event`` with state ``y``.
+
+    Checks the reset limits, applies the reset map to ``y`` in place, and on
+    FNI_RESET_CONTINUE restarts the solver from (t_event, y) and refreshes
+    the event values ``g``. ``status`` is set to FNI_STATUS_EVENT,
+    FNI_STATUS_RESET_LIMIT or FNI_STATUS_ZENO when the integration ends here
+    (always FNI_STATUS_EVENT if ``reset`` is NULL), and to 2 when it continues.
+
+    Right after the reset the guard that fired sits on zero, where round-off
+    decides its sign. So its value is probed a little later, at
+    ``t_event + delta`` along the new flow (``y + delta * f``, with ``delta``
+    a thousand ulps of the time scale), and taken as its value at the start
+    of the next step. The next root search for it starts at the probe time.
+    If the probe is still exactly zero (a tangential flow, or a guard that
+    stays at zero), the guard is masked until a step ends with it away from
+    zero. Its occurrence count restarts, so it fires on every later crossing.
+    """
+    cdef int rc
+    cdef Py_ssize_t i
+    cdef double delta, gp
+    status[0] = 2          # still running
+    if reset == NULL:
+        status[0] = FNI_STATUS_EVENT
+        return FNI_OK
+    if hopt.max_resets >= 0 and h.n_resets >= hopt.max_resets:
+        status[0] = FNI_STATUS_RESET_LIMIT
+        return FNI_OK
+    if (hopt.min_dwell > 0 and h.n_resets > 0
+            and fabs(t_event - h.last_reset_t) < hopt.min_dwell):
+        status[0] = FNI_STATUS_ZENO
+        return FNI_OK
+    rc = reset(event, t_event, y, s.n, reset_ctx)
+    if rc < 0:
+        return FNI_ERR_CALLBACK
+    if rc == FNI_RESET_STOP:
+        status[0] = FNI_STATUS_EVENT
+        return FNI_OK
+    if rc != FNI_RESET_CONTINUE:
+        return FNI_ERR_CALLBACK
+    h.n_resets += 1
+    h.last_reset_t = t_event
+    counts[event] = 0.0
+    rc = fni_solver_restart(s, t_event, y, hopt.reselect_step)
+    if rc != FNI_OK:
+        return rc
+    rc = fni_events_eval(events, n_events, t_event, s.y, s.n, g)
+    if rc != FNI_OK:
+        return rc
+    for i in range(n_events):
+        h.t_probe[i] = NAN
+    delta = 1000 * EPS * (fabs(t_event) + (s.h_abs if s.h_abs < INFINITY else 0.0))
+    if delta == 0:
+        delta = 1000 * EPS
+    delta *= s.direction
+    for i in range(s.n):
+        s.y_new[i] = s.y[i] + delta * s.f[i]      # y_new is scratch until the next step
+    if events[event].fn(t_event + delta, s.y_new, s.n, events[event].ctx, &gp) != 0:
+        return FNI_ERR_CALLBACK
+    if gp != 0:
+        g[event] = gp
+        h.t_probe[event] = t_event + delta
+        h.masked[event] = False
+    else:
+        h.masked[event] = True
+    return FNI_OK
+
+
+cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
+                              double t0, const double* y0, double t1, const fni_options* opt,
+                              const fni_event* events, Py_ssize_t n_events,
+                              fni_reset_fn reset, void* reset_ctx,
+                              const fni_hybrid_options* hopt,
+                              double* y_out, Py_ssize_t* record_event, double* record_t,
+                              double* record_y, double* record_y_after, bint* record_reset,
+                              Py_ssize_t max_records,
+                              fni_stats* stats, Py_ssize_t* n_resets) noexcept nogil:
+    """Integrate a hybrid system from (t0, y0) to t1 without the GIL.
+
+    As :func:`fni_integrate`, except that a terminal event is a *guard*: when
+    it fires, ``reset`` maps the state in place and integration continues from
+    the event (see ``fni_reset_fn``), in one call and with the step size
+    carried across. Non-terminal events are only recorded. ``hopt`` bounds the
+    number of resets (FNI_STATUS_RESET_LIMIT) and their spacing
+    (FNI_STATUS_ZENO). ``reset`` may be NULL, which makes every terminal event
+    stop the integration as in :func:`fni_integrate`.
+
+    Every located event is recorded, up to ``max_records``: ``record_y`` holds
+    the state just before it and ``record_y_after`` (if not NULL) the state
+    just after, which differs only for resets; ``record_reset`` (if not NULL)
+    flags the records where the reset map was applied. ``n_resets`` (if not NULL)
+    receives the number of resets applied. The final state at an ended
+    integration is the state after the last reset map call.
+    """
+    cdef fni_solver s
+    cdef fni_hybrid_state h
+    cdef Py_ssize_t k, e, n_found, last = -1
+    cdef bint terminate
+    cdef double* work = NULL
+    cdef double* g
+    cdef double* g_new
+    cdef double* counts
+    cdef double* roots
+    cdef double* buf
+    cdef double* y_event
+    cdef double* tmp
+    cdef Py_ssize_t* found = NULL
+    cdef int rc, hstatus
+    cdef double t_event
+
+    stats.status = FNI_STATUS_FAILED
+    stats.t_final = t0
+    stats.nfev = 0
+    stats.n_accepted = 0
+    stats.n_rejected = 0
+    stats.n_records = 0
+    if n_resets != NULL:
+        n_resets[0] = 0
+    h.masked = NULL
+    h.t_probe = NULL
+
+    rc = fni_solver_init(&s, method, fun, ctx, n, t0, y0, t1, opt)
+    if rc == FNI_OK:
+        rc = fni_hybrid_init(&h, n_events)
+    if rc != FNI_OK:
+        fni_solver_free(&s)
+        fni_hybrid_free(&h)
+        return rc
+
+    work = <double*> malloc((4 * n_events + 2 * (n if n > 0 else 1) + 1) * sizeof(double))
+    found = <Py_ssize_t*> malloc((n_events if n_events > 0 else 1) * sizeof(Py_ssize_t))
+    if work == NULL or found == NULL:
+        rc = FNI_ERR_ALLOC
+    else:
+        g = work
+        g_new = g + n_events
+        counts = g_new + n_events
+        roots = counts + n_events
+        buf = roots + n_events
+        y_event = buf + (n if n > 0 else 1)
+        for e in range(n_events):
+            counts[e] = 0.0
+        rc = fni_events_eval(events, n_events, t0, s.y, n, g)
+
+    while rc == FNI_OK:
+        rc = fni_solver_step(&s)
+        if rc != FNI_OK:
+            break
+        if s.status == FNI_FAILED:
+            stats.status = FNI_STATUS_FAILED
+            stats.t_final = s.t
+            memcpy(y_out, s.y, n * sizeof(double))
+            break
+
+        terminate = False
+        n_found = 0
+        if n_events > 0:
+            rc = fni_events_check_masked(&s, events, n_events, g, g_new, counts, found, roots,
+                                         &n_found, &terminate, buf, &h)
+            if rc != FNI_OK:
+                break
+            for k in range(n_found):
+                if stats.n_records < max_records:
+                    record_event[stats.n_records] = found[k]
+                    record_t[stats.n_records] = roots[k]
+                    if record_y != NULL:
+                        fni_solver_dense_eval(&s, roots[k], record_y + stats.n_records * n)
+                    if record_y_after != NULL:
+                        fni_solver_dense_eval(&s, roots[k],
+                                              record_y_after + stats.n_records * n)
+                    if record_reset != NULL:
+                        record_reset[stats.n_records] = False
+                    last = stats.n_records
+                stats.n_records += 1
+
+        if terminate:
+            t_event = roots[n_found - 1]
+            fni_solver_dense_eval(&s, t_event, y_event)
+            rc = fni_hybrid_reset(&s, &h, hopt, events, n_events, counts, found[n_found - 1],
+                                  t_event, y_event, reset, reset_ctx, g, &hstatus)
+            if rc != FNI_OK:
+                break
+            if last == stats.n_records - 1 and reset != NULL and (
+                    hstatus == 2 or hstatus == FNI_STATUS_EVENT):
+                if record_y_after != NULL:
+                    memcpy(record_y_after + last * n, y_event, n * sizeof(double))
+                if record_reset != NULL:
+                    record_reset[last] = True
+            if hstatus != 2:
+                stats.status = hstatus
+                stats.t_final = t_event
+                memcpy(y_out, y_event, n * sizeof(double))
+                break
+            continue
+
+        if n_events > 0:
+            fni_hybrid_unmask(&h, n_events, g_new)
+            tmp = g
+            g = g_new
+            g_new = tmp
+        if s.status == FNI_FINISHED:
+            stats.status = FNI_STATUS_FINISHED
+            stats.t_final = s.t
+            memcpy(y_out, s.y, n * sizeof(double))
+            break
+
+    stats.nfev = s.nfev
+    stats.n_accepted = s.n_accepted
+    stats.n_rejected = s.n_rejected
+    if n_resets != NULL:
+        n_resets[0] = h.n_resets
+    fni_solver_free(&s)
+    fni_hybrid_free(&h)
+    if work != NULL:
+        free(work)
+    if found != NULL:
+        free(found)
+    return rc
 
 
 cdef int fni_integrate(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
@@ -791,93 +1103,13 @@ cdef int fni_integrate(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
     row-major, if not NULL) up to ``max_records``; ``stats.n_records`` counts
     all of them. Same steps, events and results as :func:`solve_ivp`.
     """
-    cdef fni_solver s
-    cdef Py_ssize_t k, e, n_found
-    cdef bint terminate
-    cdef double* work = NULL
-    cdef double* g
-    cdef double* g_new
-    cdef double* counts
-    cdef double* roots
-    cdef double* buf
-    cdef double* tmp
-    cdef Py_ssize_t* found = NULL
-    cdef int rc
-
-    stats.status = FNI_STATUS_FAILED
-    stats.t_final = t0
-    stats.nfev = 0
-    stats.n_accepted = 0
-    stats.n_rejected = 0
-    stats.n_records = 0
-
-    rc = fni_solver_init(&s, method, fun, ctx, n, t0, y0, t1, opt)
-    if rc != FNI_OK:
-        fni_solver_free(&s)
-        return rc
-
-    if n_events > 0:
-        work = <double*> malloc((4 * n_events + (n if n > 0 else 1)) * sizeof(double))
-        found = <Py_ssize_t*> malloc(n_events * sizeof(Py_ssize_t))
-        if work == NULL or found == NULL:
-            rc = FNI_ERR_ALLOC
-        else:
-            g = work
-            g_new = g + n_events
-            counts = g_new + n_events
-            roots = counts + n_events
-            buf = roots + n_events
-            for e in range(n_events):
-                counts[e] = 0.0
-            rc = fni_events_eval(events, n_events, t0, s.y, n, g)
-
-    while rc == FNI_OK:
-        rc = fni_solver_step(&s)
-        if rc != FNI_OK:
-            break
-        if s.status == FNI_FAILED:
-            stats.status = FNI_STATUS_FAILED
-            stats.t_final = s.t
-            memcpy(y_out, s.y, n * sizeof(double))
-            break
-
-        terminate = False
-        if n_events > 0:
-            rc = fni_events_check(&s, events, n_events, g, g_new, counts, found, roots,
-                                  &n_found, &terminate, buf)
-            if rc != FNI_OK:
-                break
-            for k in range(n_found):
-                if stats.n_records < max_records:
-                    record_event[stats.n_records] = found[k]
-                    record_t[stats.n_records] = roots[k]
-                    if record_y != NULL:
-                        fni_solver_dense_eval(&s, roots[k], record_y + stats.n_records * n)
-                stats.n_records += 1
-            tmp = g
-            g = g_new
-            g_new = tmp
-
-        if terminate:
-            stats.status = FNI_STATUS_EVENT
-            stats.t_final = roots[n_found - 1]
-            fni_solver_dense_eval(&s, stats.t_final, y_out)
-            break
-        if s.status == FNI_FINISHED:
-            stats.status = FNI_STATUS_FINISHED
-            stats.t_final = s.t
-            memcpy(y_out, s.y, n * sizeof(double))
-            break
-
-    stats.nfev = s.nfev
-    stats.n_accepted = s.n_accepted
-    stats.n_rejected = s.n_rejected
-    fni_solver_free(&s)
-    if work != NULL:
-        free(work)
-    if found != NULL:
-        free(found)
-    return rc
+    cdef fni_hybrid_options hopt
+    hopt.max_resets = -1
+    hopt.min_dwell = 0.0
+    hopt.reselect_step = False
+    return fni_integrate_hybrid(method, fun, ctx, n, t0, y0, t1, opt, events, n_events,
+                                NULL, NULL, &hopt, y_out, record_event, record_t, record_y,
+                                NULL, NULL, max_records, stats, NULL)
 
 
 # =============================================================================
@@ -935,6 +1167,19 @@ cdef inline void _event_of(EventFunction ev, double max_events, fni_event* out) 
         out.ctx = <void*> ev
     out.direction = ev.direction
     out.max_events = max_events
+
+
+cdef int _reset_trampoline(Py_ssize_t event, double t, double* y, Py_ssize_t n,
+                           void* ctx) except -1:
+    return (<ResetMap> ctx).eval(event, t, y, n)
+
+
+cdef inline fni_reset_fn _reset_of(ResetMap reset, void** ctx) noexcept:
+    if reset.c_fn != NULL:
+        ctx[0] = reset.c_ctx
+        return reset.c_fn
+    ctx[0] = <void*> reset
+    return <fni_reset_fn> _reset_trampoline
 
 
 cdef inline Py_ssize_t _searchsorted(const double[::1] a, double v, bint left) noexcept:
@@ -1222,6 +1467,131 @@ cdef class ComponentCrossing(EventFunction):
         if self.data.index >= n:
             raise IndexError(f"event index {self.data.index} out of range for state of size {n}")
         return 0
+
+
+# =============================================================================
+# Reset maps (hybrid integration)
+# =============================================================================
+
+cdef class ResetMap:
+    """Base class for native reset maps of :func:`solve_hybrid` / :func:`integrate_hybrid`.
+
+    When a terminal event (a *guard*) fires, the reset map receives the event
+    index, the time and the state just before it, and overwrites the state
+    with the one just after. Subclass in Cython and either set ``c_fn`` (a
+    ``nogil`` :c:type:`fni_reset_fn`) and ``c_ctx``, which also works with
+    the GIL-free C API, or override the ``cdef`` method ``eval``. A discrete
+    mode, such as which arc or contact state is active, belongs in a context
+    that the reset map shares with the system's right-hand side.
+    """
+
+    def __cinit__(self, *args, **kwargs):
+        self.c_fn = NULL
+        self.c_ctx = NULL
+
+    @property
+    def has_native_fn(self):
+        return self.c_fn != NULL
+
+    cdef int check_size(self, Py_ssize_t n) except -1:
+        return 0
+
+    cdef int eval(self, Py_ssize_t event, double t, double* y, Py_ssize_t n) except -1:
+        cdef int rc
+        if self.c_fn == NULL:
+            raise NotImplementedError(f"{type(self).__name__} must implement eval() or set c_fn")
+        rc = self.c_fn(event, t, y, n, self.c_ctx)
+        if rc < 0:
+            raise RuntimeError(f"{type(self).__name__}: native reset map returned an error code")
+        return rc
+
+    def __call__(self, Py_ssize_t event, double t, y):
+        """``reset(event, t, y)``: the post-event state, or None to stop."""
+        out = np.array(y, dtype=np.float64, copy=True).reshape(-1)
+        cdef double[::1] view = out if out.shape[0] > 0 else np.zeros(1)
+        rc = self.eval(event, t, &view[0], out.shape[0])
+        return None if rc == FNI_RESET_STOP else out
+
+
+cdef class PythonReset(ResetMap):
+    """Adapter for a callable ``reset(event, t, y, *args)``.
+
+    It returns the post-event state (array-like of length n) to continue, or
+    ``None`` to stop the integration at the event.
+    """
+
+    cdef object fun
+    cdef tuple args
+
+    def __init__(self, fun, args=()):
+        if not callable(fun):
+            raise TypeError("reset must be callable")
+        self.fun = fun
+        self.args = tuple(args)
+
+    cdef int eval(self, Py_ssize_t event, double t, double* y, Py_ssize_t n) except -1:
+        cdef Py_ssize_t i
+        out = self.fun(event, t, _array_from(y, n), *self.args)
+        if out is None:
+            return FNI_RESET_STOP
+        arr = np.asarray(out, dtype=np.float64).reshape(-1)
+        if arr.shape[0] != n:
+            raise ValueError(f"reset returned {arr.shape[0]} values for a state of size {n}")
+        cdef const double[::1] v = np.ascontiguousarray(arr)
+        for i in range(n):
+            y[i] = v[i]
+        return FNI_RESET_CONTINUE
+
+
+cdef struct _scale_ctx:
+    Py_ssize_t index
+    const double* factor     # -> params[0]
+
+
+cdef int _scale_component_fn(Py_ssize_t event, double t, double* y, Py_ssize_t n,
+                             void* ctx) noexcept nogil:
+    cdef _scale_ctx* c = <_scale_ctx*> ctx
+    y[c.index] *= c.factor[0]
+    return FNI_RESET_CONTINUE
+
+
+cdef class ScaleComponent(ResetMap):
+    """Native reset ``y[index] *= factor``, for every guard.
+
+    ``factor`` is runtime parameter 0. With ``factor = -e`` on a velocity it
+    is an impact with coefficient of restitution ``e`` (a bouncing ball).
+    """
+
+    cdef _scale_ctx data
+    cdef readonly Py_ssize_t n_params
+    cdef double[::1] _params
+
+    def __init__(self, Py_ssize_t index, double factor):
+        if index < 0:
+            raise ValueError("index must be non-negative")
+        self._params = np.array([factor])
+        self.n_params = 1
+        self.data.index = index
+        self.data.factor = &self._params[0]
+        self.c_fn = _scale_component_fn
+        self.c_ctx = &self.data
+
+    @property
+    def index(self):
+        return self.data.index
+
+    cdef int check_size(self, Py_ssize_t n) except -1:
+        if self.data.index >= n:
+            raise IndexError(f"reset index {self.data.index} out of range for state of size {n}")
+        return 0
+
+    @property
+    def params(self):
+        return np.asarray(self._params).copy()
+
+    @params.setter
+    def params(self, value):
+        _set_params(self._params, 1, value, "ScaleComponent")
 
 
 # =============================================================================
@@ -1700,29 +2070,45 @@ class OdeResult(dict):
 
 
 cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
-                   Py_ssize_t t_eval_i, bint dense_output, _EventArray events):
-    """The solve_ivp main loop (same control flow as scipy's), on the C core."""
+                   Py_ssize_t t_eval_i, bint dense_output, _EventArray events,
+                   ResetMap reset=None, object hybrid=None):
+    """The solve_ivp main loop (same control flow as scipy's), on the C core.
+
+    With ``hybrid`` (a dict of fni_hybrid_options fields), terminal events are
+    guards handled by ``reset`` through ``fni_hybrid_reset``, exactly as in
+    ``fni_integrate_hybrid``.
+    """
     cdef fni_solver* s = &solver.s
     cdef Py_ssize_t n = s.n
     cdef Py_ssize_t ncoef = s.tab.n_dense_coef
     cdef Py_ssize_t n_events = events.n
     cdef bint has_t_eval = t_eval_obj is not None
+    cdef bint is_hybrid = hybrid is not None
     cdef const double[::1] t_eval
     cdef Py_ssize_t t_eval_i_new, j, k, e, idx, n_found
     cdef int status = 2   # 2 = still running
+    cdef int hstatus
     cdef double t_old, t, root
     cdef const double* y_ptr
     cdef double* seg_row
-    cdef bint terminate
+    cdef bint terminate, reset_done, reset_called
+    cdef fni_hybrid_options hopt
+    cdef fni_hybrid_state hst
+    cdef fni_reset_fn reset_fn = NULL
+    cdef void* reset_ctx = NULL
 
     if has_t_eval:
         t_eval = t_eval_obj
 
     traj = _RowBuffer(n)
     cdef _RowBuffer segs = _RowBuffer(2 + n + ncoef * n) if dense_output else None
-    cdef _RowBuffer bounds = _RowBuffer(0) if (dense_output and has_t_eval) else None
+    # Hybrid dense output always keeps its own breakpoints: the trajectory
+    # repeats each reset time (before and after), which ts may not.
+    cdef _RowBuffer bounds = (_RowBuffer(0) if (dense_output and (has_t_eval or is_hybrid))
+                              else None)
     cdef double[::1] buf = _empty1d(max(n, 1))       # interpolation scratch
     cdef double[::1] y_term = _empty1d(max(n, 1))    # state at a terminal event
+    cdef double[::1] y_minus = _empty1d(max(n, 1))   # hybrid: state before a reset
 
     if not has_t_eval:
         traj.push_row(t0, s.y)
@@ -1737,74 +2123,115 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
     cdef Py_ssize_t[::1] found = np.empty(max(n_events, 1), dtype=np.intp)
     t_events = [[] for _ in range(n_events)]
     y_events = [[] for _ in range(n_events)]
+    reset_t, reset_e, reset_before, reset_after = [], [], [], []
     if n_events > 0:
         _check(fni_events_eval(events.ev, n_events, t0, s.y, n, &g[0]))
 
-    while status == 2:
-        solver._step()
-        if s.status == FNI_FINISHED:
-            status = 0
-        elif s.status == FNI_FAILED:
-            status = -1
-            break
+    hst.masked = NULL
+    hst.t_probe = NULL
+    if is_hybrid:
+        hopt.max_resets = hybrid["max_resets"]
+        hopt.min_dwell = hybrid["min_dwell"]
+        hopt.reselect_step = hybrid["reselect_step"]
+        if reset is not None:
+            reset_fn = _reset_of(reset, &reset_ctx)
+        _check(fni_hybrid_init(&hst, n_events))
 
-        t_old = s.t_old
-        t = s.t
-        y_ptr = s.y
+    try:
+        while status == 2:
+            solver._step()
+            if s.status == FNI_FINISHED:
+                status = 0
+            elif s.status == FNI_FAILED:
+                status = -1
+                break
 
-        if dense_output:
-            solver._ensure_dense()
-            idx = segs.push(t_old)
-            seg_row = &segs.r[idx, 0]
-            seg_row[0] = t_old
-            seg_row[1] = t - t_old
-            if n > 0:
-                memcpy(seg_row + 2, s.y_old, n * sizeof(double))
-                memcpy(seg_row + 2 + n, s.dense, ncoef * n * sizeof(double))
+            t_old = s.t_old
+            t = s.t
+            y_ptr = s.y
+            reset_done = False
+            reset_called = False
 
-        if n_events > 0:
-            _check(fni_events_check(s, events.ev, n_events, &g[0], &g_new[0], &counts[0],
-                                    &found[0], &roots[0], &n_found, &terminate, &buf[0]))
-            for k in range(n_found):
-                e = found[k]
-                root = roots[k]
-                t_events[e].append(root)
-                fni_solver_dense_eval(s, root, &buf[0])
-                y_events[e].append(_array_from(&buf[0], n))
-            if terminate:
-                status = 1
-                t = roots[n_found - 1]
-                fni_solver_dense_eval(s, t, &y_term[0])
-                y_ptr = &y_term[0]
-            g, g_new = g_new, g
+            if dense_output:
+                solver._ensure_dense()
+                idx = segs.push(t_old)
+                seg_row = &segs.r[idx, 0]
+                seg_row[0] = t_old
+                seg_row[1] = t - t_old
+                if n > 0:
+                    memcpy(seg_row + 2, s.y_old, n * sizeof(double))
+                    memcpy(seg_row + 2 + n, s.dense, ncoef * n * sizeof(double))
 
-        if not has_t_eval:
-            if dense_output and traj.count > 1 and traj.t[traj.count - 1] == t:
-                segs.count -= 1    # scipy's donot_append: drop the duplicate segment
-            else:
-                traj.push_row(t, y_ptr)
-        else:
-            # The value in t_eval equal to t is included.
-            if s.direction > 0:
-                t_eval_i_new = _searchsorted(t_eval, t, False)
-                if t_eval_i_new > t_eval_i:
-                    solver._ensure_dense()
-                    for j in range(t_eval_i, t_eval_i_new):
-                        idx = traj.push(t_eval[j])
+            if n_events > 0:
+                _check(fni_events_check_masked(s, events.ev, n_events, &g[0], &g_new[0],
+                                               &counts[0], &found[0], &roots[0], &n_found,
+                                               &terminate, &buf[0],
+                                               &hst if is_hybrid else NULL))
+                for k in range(n_found):
+                    e = found[k]
+                    root = roots[k]
+                    t_events[e].append(root)
+                    fni_solver_dense_eval(s, root, &buf[0])
+                    y_events[e].append(_array_from(&buf[0], n))
+                if terminate:
+                    status = 1
+                    t = roots[n_found - 1]
+                    fni_solver_dense_eval(s, t, &y_term[0])
+                    y_ptr = &y_term[0]
+                    if is_hybrid:
                         if n > 0:
-                            fni_solver_dense_eval(s, t_eval[j], &traj.r[idx, 0])
-                    t_eval_i = t_eval_i_new
+                            memcpy(&y_minus[0], &y_term[0], n * sizeof(double))
+                        # Take the t_eval points up to the event from this step's
+                        # interpolant before a restart discards it.
+                        if has_t_eval:
+                            _take_t_eval(s, t_eval, &t_eval_i, t, traj, n)
+                        _check(fni_hybrid_reset(s, &hst, &hopt, events.ev, n_events,
+                                                &counts[0], found[n_found - 1], t,
+                                                &y_term[0], reset_fn, reset_ctx, &g[0],
+                                                &hstatus))
+                        reset_called = reset_fn != NULL and (hstatus == 2
+                                                             or hstatus == FNI_STATUS_EVENT)
+                        if reset_called:
+                            reset_t.append(t)
+                            reset_e.append(found[n_found - 1])
+                            reset_before.append(_array_from(&y_minus[0], n))
+                            reset_after.append(_array_from(&y_term[0], n))
+                        status = 2 if hstatus == 2 else hstatus
+                        reset_done = True
+                if not reset_done:
+                    if is_hybrid:
+                        fni_hybrid_unmask(&hst, n_events, &g_new[0])
+                    g, g_new = g_new, g
+
+            if is_hybrid:
+                if not has_t_eval:
+                    if reset_done:
+                        # Both sides of the event: the state before, then after.
+                        traj.push_row(t, &y_minus[0])
+                        if reset_called:
+                            traj.push_row(t, &y_term[0])
+                    elif not (t == t_old and traj.t[traj.count - 1] == t):
+                        traj.push_row(t, y_ptr)
+                elif not reset_done:
+                    _take_t_eval(s, t_eval, &t_eval_i, t, traj, n)
+                if bounds is not None:
+                    if bounds.t[bounds.count - 1] == t:
+                        segs.count -= 1     # zero-length piece (event at the step start)
+                    else:
+                        bounds.push(t)
+                continue
+
+            if not has_t_eval:
+                if dense_output and traj.count > 1 and traj.t[traj.count - 1] == t:
+                    segs.count -= 1    # scipy's donot_append: drop the duplicate segment
+                else:
+                    traj.push_row(t, y_ptr)
             else:
-                t_eval_i_new = _searchsorted(t_eval, t, True)
-                if t_eval_i > t_eval_i_new:
-                    solver._ensure_dense()
-                    for j in range(t_eval_i - 1, t_eval_i_new - 1, -1):
-                        idx = traj.push(t_eval[j])
-                        if n > 0:
-                            fni_solver_dense_eval(s, t_eval[j], &traj.r[idx, 0])
-                    t_eval_i = t_eval_i_new
-            if bounds is not None:
-                bounds.push(t)
+                _take_t_eval(s, t_eval, &t_eval_i, t, traj, n)
+                if bounds is not None:
+                    bounds.push(t)
+    finally:
+        fni_hybrid_free(&hst)
 
     message = MESSAGES.get(status, solver.message)
 
@@ -1819,16 +2246,48 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
     ys = traj.rows().T
 
     if dense_output:
-        sol = OdeSolution(ts if not has_t_eval else bounds.times(),
+        sol = OdeSolution(ts if bounds is None else bounds.times(),
                           segs.rows(), s.tab.dense_kind, n, ncoef)
     else:
         sol = None
 
-    return OdeResult(
+    out = OdeResult(
         t=ts, y=ys, sol=sol, t_events=t_events_out, y_events=y_events_out,
         nfev=s.nfev, njev=0, nlu=0, status=status, message=message,
         success=status >= 0, n_accepted=s.n_accepted, n_rejected=s.n_rejected,
     )
+    if is_hybrid:
+        out.t_resets = np.asarray(reset_t, dtype=np.float64)
+        out.reset_events = np.asarray(reset_e, dtype=np.intp)
+        out.y_before_resets = np.asarray(reset_before).reshape(-1, n)
+        out.y_after_resets = np.asarray(reset_after).reshape(-1, n)
+    return out
+
+
+cdef int _take_t_eval(fni_solver* s, const double[::1] t_eval, Py_ssize_t* t_eval_i,
+                      double t, _RowBuffer traj, Py_ssize_t n) except -1:
+    """Interpolate the t_eval points reached by time ``t`` in the last step."""
+    cdef Py_ssize_t j, idx, t_eval_i_new
+    # The value in t_eval equal to t is included.
+    if s.direction > 0:
+        t_eval_i_new = _searchsorted(t_eval, t, False)
+        if t_eval_i_new > t_eval_i[0]:
+            _check(fni_solver_ensure_dense(s))
+            for j in range(t_eval_i[0], t_eval_i_new):
+                idx = traj.push(t_eval[j])
+                if n > 0:
+                    fni_solver_dense_eval(s, t_eval[j], &traj.r[idx, 0])
+            t_eval_i[0] = t_eval_i_new
+    else:
+        t_eval_i_new = _searchsorted(t_eval, t, True)
+        if t_eval_i[0] > t_eval_i_new:
+            _check(fni_solver_ensure_dense(s))
+            for j in range(t_eval_i[0] - 1, t_eval_i_new - 1, -1):
+                idx = traj.push(t_eval[j])
+                if n > 0:
+                    fni_solver_dense_eval(s, t_eval[j], &traj.r[idx, 0])
+            t_eval_i[0] = t_eval_i_new
+    return 0
 
 
 def _resolve_method(method):
@@ -1903,7 +2362,14 @@ def solve_ivp(fun, t_span, y0, method="RK45", t_eval=None, dense_output=False,
         ``nlu``, ``status`` (-1 failed, 0 finished, 1 terminal event),
         ``message``, ``success``, plus ``n_accepted`` and ``n_rejected``.
     """
+    return _solve(fun, t_span, y0, method, t_eval, dense_output, events, vectorized, args,
+                  options, None, None)
+
+
+cdef object _solve(fun, t_span, y0, method, t_eval, dense_output, events, vectorized, args,
+                   dict options, object reset, object hybrid):
     cdef Py_ssize_t t_eval_i = 0
+    cdef ResetMap reset_map = None
 
     solver_cls = _resolve_method(method)
     t0, tf = map(float, t_span)
@@ -1931,8 +2397,87 @@ def solve_ivp(fun, t_span, y0, method="RK45", t_eval=None, dense_output=False,
 
     event_list, max_events, _ = _prepare_events(events, args)
     ev_array = _EventArray(event_list, max_events, solver.n)
+    if hybrid is not None:
+        reset_map = _as_reset(reset, args, solver.n)
 
-    return _drive(solver, t0, t_eval, t_eval_i, dense_output, ev_array)
+    return _drive(solver, t0, t_eval, t_eval_i, dense_output, ev_array, reset_map, hybrid)
+
+
+def _as_reset(reset, args, Py_ssize_t n):
+    if reset is None:
+        return None
+    if not isinstance(reset, ResetMap):
+        reset = PythonReset(reset, () if args is None else args)
+    (<ResetMap> reset).check_size(n)
+    return reset
+
+
+def _hybrid_options(max_resets, min_dwell, reselect_step):
+    max_resets = -1 if max_resets is None else int(max_resets)
+    min_dwell = float(min_dwell)
+    if not min_dwell >= 0:
+        raise ValueError("`min_dwell` must be non-negative.")
+    return {"max_resets": max_resets, "min_dwell": min_dwell,
+            "reselect_step": bool(reselect_step)}
+
+
+def solve_hybrid(fun, t_span, y0, events, reset, method="RK45", t_eval=None,
+                 dense_output=False, vectorized=False, args=None, max_resets=10000,
+                 min_dwell=0.0, reselect_step=False, **options):
+    """Solve a hybrid system: a flow with guards and reset maps.
+
+    Like :func:`solve_ivp`, except that every **terminal** event is a guard.
+    When one fires, ``reset`` maps the state across it and integration
+    continues from the event, in the same solver and with the step size
+    carried over. Non-terminal events are only recorded, as in ``solve_ivp``.
+    The flow may depend on a discrete mode (a bang-bang arc, a contact state)
+    that ``reset`` updates. Keep the mode in an object the system and the
+    reset map share.
+
+    Parameters
+    ----------
+    fun, t_span, y0, method, t_eval, dense_output, vectorized, args, **options
+        As in :func:`solve_ivp`.
+    events : callable, EventFunction, or list of them
+        Guards are the terminal ones (``terminal=True``, or a count *k*: the
+        guard fires on every *k*-th crossing).
+    reset : ResetMap or callable
+        ``reset(event, t, y, *args)``: ``event`` is the index of the guard in
+        ``events`` and ``y`` the state just before it. Return the state just
+        after (length n) to continue, or ``None`` to stop with status 1. A
+        native :class:`ResetMap` avoids the Python call overhead.
+    max_resets : int or None
+        Stop with status -2 when one more reset would exceed this many
+        (``None``: no limit).
+    min_dwell : float
+        Stop with status -3 (Zeno behaviour) if a reset follows the previous
+        one by less than this. ``0`` disables the check.
+    reselect_step : bool
+        Rerun the initial-step heuristic after each reset instead of keeping
+        the controller's current step size.
+
+    Returns
+    -------
+    OdeResult
+        The fields of :func:`solve_ivp`, plus ``t_resets``, ``reset_events``,
+        ``y_before_resets`` and ``y_after_resets``. Without ``t_eval``, ``t``
+        and ``y`` contain each reset time twice: the state before it, then
+        after. ``sol`` is piecewise across resets and returns the state before
+        a reset at its exact time. ``t_events`` / ``y_events`` record every
+        event with the state before it.
+
+    Notes
+    -----
+    Right after a reset, the guard that fired sits on zero, and round-off
+    decides its sign. FNI therefore probes it slightly later along the new
+    flow (as SUNDIALS' root finder does). That probe sets which side it
+    starts on, so the zero it sits on cannot fire it again, while a real
+    crossing later in the same step still does. A guard that stays exactly
+    zero is masked until it moves away. Events are re-evaluated after the
+    reset, and a jump of the state is never counted as a crossing.
+    """
+    return _solve(fun, t_span, y0, method, t_eval, dense_output, events, vectorized, args,
+                  options, reset, _hybrid_options(max_resets, min_dwell, reselect_step))
 
 
 # =============================================================================
@@ -1961,7 +2506,44 @@ def integrate(fun, t_span, y0, method="RK45", *, rtol=1e-3, atol=1e-6, first_ste
         ``n_event_records`` (all located events, which may exceed
         ``max_records``) and ``gil_released``.
     """
+    return _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events, args,
+                      max_records, release_gil, None, None)
+
+
+def integrate_hybrid(fun, t_span, y0, events, reset, method="RK45", *, rtol=1e-3, atol=1e-6,
+                     first_step=None, max_step=np.inf, args=None, max_resets=10000,
+                     min_dwell=0.0, reselect_step=False, max_records=1024,
+                     release_gil=None):
+    """Integrate a hybrid system to the end of ``t_span`` via ``fni_integrate_hybrid``.
+
+    The endpoint counterpart of :func:`solve_hybrid` (guards, reset maps and
+    limits as documented there), as :func:`integrate` is of
+    :func:`solve_ivp`: same steps, same events and resets, no trajectory. It
+    runs without the GIL when the system, every event and the reset map are
+    native.
+
+    Returns
+    -------
+    OdeResult
+        The fields of :func:`integrate`, plus ``n_resets`` and, over the
+        recorded events, ``t_resets``, ``reset_events``, ``y_before_resets``
+        and ``y_after_resets``.
+    """
+    return _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events, args,
+                      max_records, release_gil, reset,
+                      _hybrid_options(max_resets, min_dwell, reselect_step))
+
+
+cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events,
+                       args, max_records, release_gil, reset, hybrid):
     cdef fni_options opt
+    cdef fni_hybrid_options hopt
+    cdef fni_reset_fn reset_fn = NULL
+    cdef void* reset_ctx = NULL
+    cdef ResetMap reset_map = None
+    cdef double[::1] rec_y_after
+    cdef int[::1] rec_reset
+    cdef Py_ssize_t n_resets = 0
     cdef fni_stats stats
     cdef void* ctx
     cdef fni_rhs_fn fn
@@ -2015,21 +2597,40 @@ def integrate(fun, t_span, y0, method="RK45", *, rtol=1e-3, atol=1e-6, first_ste
     rec_e = np.zeros(max(cap, 1), dtype=np.intp)
     rec_t = np.zeros(max(cap, 1))
     rec_y_flat = np.zeros(max(cap * n, 1))
+    rec_y_after = np.zeros(max(cap * n, 1))
+    rec_reset = np.zeros(max(cap, 1), dtype=np.intc)
 
     fn = _rhs_of(<OdeSystem> system, &ctx)
     nogil_ok = (<OdeSystem> system).c_fn != NULL and ev_array.all_native
+    if hybrid is not None:
+        hopt.max_resets = hybrid["max_resets"]
+        hopt.min_dwell = hybrid["min_dwell"]
+        hopt.reselect_step = hybrid["reselect_step"]
+        reset_map = _as_reset(reset, args, n)
+        if reset_map is not None:
+            reset_fn = _reset_of(reset_map, &reset_ctx)
+            nogil_ok = nogil_ok and reset_map.c_fn != NULL
+    else:
+        hopt.max_resets = -1
+        hopt.min_dwell = 0.0
+        hopt.reselect_step = False
     if release_gil is None:
         release_gil = nogil_ok
     elif release_gil and not nogil_ok:
-        raise TypeError("release_gil=True needs a native c_fn on the system and every event")
+        raise TypeError("release_gil=True needs a native c_fn on the system, every event "
+                        "and the reset map")
 
     if release_gil:
         with nogil:
-            rc = fni_integrate(m, fn, ctx, n, t0, &y0_view[0], t1, &opt, ev_array.ev, ev_array.n,
-                               &y_out[0], &rec_e[0], &rec_t[0], &rec_y_flat[0], cap, &stats)
+            rc = fni_integrate_hybrid(m, fn, ctx, n, t0, &y0_view[0], t1, &opt, ev_array.ev,
+                                      ev_array.n, reset_fn, reset_ctx, &hopt, &y_out[0],
+                                      &rec_e[0], &rec_t[0], &rec_y_flat[0], &rec_y_after[0],
+                                      <bint*> &rec_reset[0], cap, &stats, &n_resets)
     else:
-        rc = fni_integrate(m, fn, ctx, n, t0, &y0_view[0], t1, &opt, ev_array.ev, ev_array.n,
-                           &y_out[0], &rec_e[0], &rec_t[0], &rec_y_flat[0], cap, &stats)
+        rc = fni_integrate_hybrid(m, fn, ctx, n, t0, &y0_view[0], t1, &opt, ev_array.ev,
+                                  ev_array.n, reset_fn, reset_ctx, &hopt, &y_out[0],
+                                  &rec_e[0], &rec_t[0], &rec_y_flat[0], &rec_y_after[0],
+                                  <bint*> &rec_reset[0], cap, &stats, &n_resets)
     _check(rc)
 
     if ev_array.n > 0:
@@ -2044,10 +2645,19 @@ def integrate(fun, t_span, y0, method="RK45", *, rtol=1e-3, atol=1e-6, first_ste
         t_events = y_events = None
 
     status = stats.status
-    return OdeResult(
+    out = OdeResult(
         t=stats.t_final, y=np.asarray(y_out)[:n].copy(), status=status,
         message=MESSAGES.get(status, MSG_TOO_SMALL_STEP), success=status >= 0,
         nfev=stats.nfev, n_accepted=stats.n_accepted, n_rejected=stats.n_rejected,
         t_events=t_events, y_events=y_events, n_event_records=stats.n_records,
         gil_released=bool(release_gil),
     )
+    if hybrid is not None:
+        k_rec = min(stats.n_records, cap)
+        is_reset = np.asarray(rec_reset)[:k_rec].astype(bool)
+        out.n_resets = n_resets
+        out.t_resets = np.asarray(rec_t)[:k_rec][is_reset].copy()
+        out.reset_events = np.asarray(rec_e)[:k_rec][is_reset].copy()
+        out.y_before_resets = np.asarray(rec_y_flat)[:k_rec * n].reshape(k_rec, n)[is_reset].copy()
+        out.y_after_resets = np.asarray(rec_y_after)[:k_rec * n].reshape(k_rec, n)[is_reset].copy()
+    return out

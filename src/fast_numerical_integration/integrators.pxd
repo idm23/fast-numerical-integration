@@ -34,6 +34,20 @@ ctypedef int (*fni_rhs_fn)(double t, const double* y, double* dydt, Py_ssize_t n
 ctypedef int (*fni_event_fn)(double t, const double* y, Py_ssize_t n, void* ctx,
                              double* g) noexcept nogil
 
+# Reset map, called when terminal event ``event`` fires at ``t`` during a
+# hybrid integration (fni_integrate_hybrid). ``y`` holds the state just before
+# the event; overwrite it in place with the state just after. Return
+# FNI_RESET_CONTINUE to keep integrating from there, FNI_RESET_STOP to end the
+# integration (status FNI_STATUS_EVENT, final state ``y``), or a negative
+# value on error (FNI_ERR_CALLBACK). A discrete mode (e.g. which arc or contact
+# state is active) lives in the caller's context, shared with the RHS.
+ctypedef int (*fni_reset_fn)(Py_ssize_t event, double t, double* y, Py_ssize_t n,
+                             void* ctx) noexcept nogil
+
+cdef enum:
+    FNI_RESET_CONTINUE = 0
+    FNI_RESET_STOP = 1
+
 cdef enum:
     # methods
     FNI_RK23 = 0
@@ -51,6 +65,8 @@ cdef enum:
     FNI_STATUS_FAILED = -1
     FNI_STATUS_FINISHED = 0
     FNI_STATUS_EVENT = 1     # terminated by a terminal event
+    FNI_STATUS_RESET_LIMIT = -2   # hybrid: more than max_resets resets
+    FNI_STATUS_ZENO = -3          # hybrid: two resets closer than min_dwell
 
 cdef enum:
     # return codes (0 = success)
@@ -127,6 +143,21 @@ cdef struct fni_event:
     double direction         # >0: increasing only, <0: decreasing only, 0: both
     double max_events        # terminate after this many occurrences (INFINITY: never)
 
+cdef struct fni_hybrid_options:
+    Py_ssize_t max_resets    # stop with FNI_STATUS_RESET_LIMIT beyond this many (< 0: no limit)
+    double min_dwell         # stop with FNI_STATUS_ZENO if a reset follows the previous
+                             # one by less than this (0: off)
+    bint reselect_step       # after a reset, rerun the initial-step heuristic instead
+                             # of keeping the current step size
+
+# Guard bookkeeping of a hybrid integration (see fni_hybrid_init).
+cdef struct fni_hybrid_state:
+    Py_ssize_t n_resets
+    double last_reset_t
+    bint* masked             # per event: ignored until it leaves zero after its reset
+    double* t_probe          # per event: where its value was probed after its reset
+                             # (NaN otherwise); the next root search starts there
+
 cdef struct fni_stats:
     int status               # FNI_STATUS_*
     double t_final
@@ -149,6 +180,31 @@ cdef int fni_events_check(fni_solver* s, const fni_event* events, Py_ssize_t n_e
                           const double* g, double* g_new, double* counts,
                           Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
                           bint* terminate, double* buf) noexcept nogil
+cdef int fni_solver_restart(fni_solver* s, double t, const double* y,
+                            bint reselect_step) noexcept nogil
+cdef int fni_events_check_masked(fni_solver* s, const fni_event* events, Py_ssize_t n_events,
+                                 const double* g, double* g_new, double* counts,
+                                 Py_ssize_t* found, double* roots, Py_ssize_t* n_found,
+                                 bint* terminate, double* buf,
+                                 const fni_hybrid_state* h) noexcept nogil
+cdef int fni_hybrid_init(fni_hybrid_state* h, Py_ssize_t n_events) noexcept nogil
+cdef void fni_hybrid_free(fni_hybrid_state* h) noexcept nogil
+cdef void fni_hybrid_unmask(fni_hybrid_state* h, Py_ssize_t n_events,
+                            const double* g_new) noexcept nogil
+cdef int fni_hybrid_reset(fni_solver* s, fni_hybrid_state* h, const fni_hybrid_options* hopt,
+                          const fni_event* events, Py_ssize_t n_events, double* counts,
+                          Py_ssize_t event, double t_event, double* y,
+                          fni_reset_fn reset, void* reset_ctx, double* g,
+                          int* status) noexcept nogil
+cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
+                              double t0, const double* y0, double t1, const fni_options* opt,
+                              const fni_event* events, Py_ssize_t n_events,
+                              fni_reset_fn reset, void* reset_ctx,
+                              const fni_hybrid_options* hopt,
+                              double* y_out, Py_ssize_t* record_event, double* record_t,
+                              double* record_y, double* record_y_after, bint* record_reset,
+                              Py_ssize_t max_records,
+                              fni_stats* stats, Py_ssize_t* n_resets) noexcept nogil
 cdef int fni_integrate(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
                        double t0, const double* y0, double t1, const fni_options* opt,
                        const fni_event* events, Py_ssize_t n_events,
@@ -199,6 +255,19 @@ cdef class EventFunction:
     cdef int check_size(self, Py_ssize_t n) except -1
     # Return g(t, y); events are located at sign changes of g.
     cdef double eval(self, double t, const double* y, Py_ssize_t n) except? -1
+
+
+cdef class ResetMap:
+    # Optional GIL-free implementation (see fni_reset_fn); otherwise override
+    # eval. A reset map usually shares its context (and mode) with the system.
+    cdef fni_reset_fn c_fn
+    cdef void* c_ctx
+
+    cdef int check_size(self, Py_ssize_t n) except -1
+
+    # Overwrite y with the post-event state; return FNI_RESET_CONTINUE or
+    # FNI_RESET_STOP, or -1 with an exception set.
+    cdef int eval(self, Py_ssize_t event, double t, double* y, Py_ssize_t n) except -1
 
 
 cdef class RungeKutta:
