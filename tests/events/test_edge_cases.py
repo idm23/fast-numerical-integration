@@ -245,3 +245,29 @@ def test_event_with_t_eval_and_dense_output_after_termination(method):
     assert res.t.max() <= t_stop
     np.testing.assert_allclose(res.sol(res.t_events[0]), res.y_events[0].T, atol=1e-12)
     np.testing.assert_array_equal(res.t, ref.t)
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_root_within_rounding_of_a_step_end(method):
+    """The scan sees a sign change between a step's ends, but re-evaluated on
+    the dense output both ends lie on one side. The state at a step end and
+    the interpolant there can differ in the last bits, so this happens when
+    the root is within rounding of the end. The root is then that end, not an
+    error (scipy's brentq raises "f(a) and f(b) must have different signs")."""
+    first = solve_ivp(unit_drift, (0.0, 1.0), [0.0], method=method, rtol=1e-6, atol=1e-9)
+    t_end = float(first.t[len(first.t) // 2])           # an interior step end
+    seen = set()
+
+    def event(t, y):
+        # +tiny at t_end the first time (the step's own state), -tiny when
+        # evaluated there again (the dense output), as rounding can make it.
+        value = t - t_end + 1e-300
+        if t == t_end:
+            value = 1e-300 if t not in seen else -1e-300
+            seen.add(t)
+        return value
+
+    sol = solve_ivp(unit_drift, (0.0, 1.0), [0.0], method=method, rtol=1e-6, atol=1e-9,
+                    events=[event])
+    assert sol.status == 0
+    assert sol.t_events[0].tolist() == [t_end]

@@ -680,7 +680,13 @@ cdef int _brentq_event(const fni_solver* s, const fni_event* ev, double xa, doub
     if rc != FNI_OK:
         return rc
     if fpre * fcur > 0:
-        return FNI_ERR_ROOT_SIGN
+        # The scan saw a sign change between these ends, but on the dense
+        # output both lie on one side: the values differ in the last bits
+        # (the step's state against its interpolant there), so the root is
+        # within rounding of an end. Take the end closer to zero. scipy's
+        # brentq would raise here instead.
+        root[0] = xpre if fabs(fpre) <= fabs(fcur) else xcur
+        return FNI_OK
     if fpre == 0:
         root[0] = xpre
         return FNI_OK
