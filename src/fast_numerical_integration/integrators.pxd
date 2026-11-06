@@ -186,6 +186,9 @@ cdef struct fni_hybrid_state:
     bint* masked             # per event: ignored until it leaves zero after its reset
     double* t_probe          # per event: where its value was probed after its reset
                              # (NaN otherwise); the next root search starts there
+    double* t_fired          # per event: when it last reset (NaN before that)
+    double* g_pending        # per event: its value before a root it shares with the
+                             # event that just fired (NaN otherwise)
 
 cdef struct fni_stats:
     int status               # FNI_STATUS_*

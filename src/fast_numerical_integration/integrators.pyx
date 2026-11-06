@@ -1035,11 +1035,15 @@ cdef int fni_hybrid_init(fni_hybrid_state* h, Py_ssize_t n_events) noexcept nogi
     h.last_reset_t = NAN
     h.masked = <bint*> malloc((n_events if n_events > 0 else 1) * sizeof(bint))
     h.t_probe = <double*> malloc((n_events if n_events > 0 else 1) * sizeof(double))
-    if h.masked == NULL or h.t_probe == NULL:
+    h.t_fired = <double*> malloc((n_events if n_events > 0 else 1) * sizeof(double))
+    h.g_pending = <double*> malloc((n_events if n_events > 0 else 1) * sizeof(double))
+    if h.masked == NULL or h.t_probe == NULL or h.t_fired == NULL or h.g_pending == NULL:
         return FNI_ERR_ALLOC
     for e in range(n_events):
         h.masked[e] = False
         h.t_probe[e] = NAN
+        h.t_fired[e] = NAN
+        h.g_pending[e] = NAN
     return FNI_OK
 
 
@@ -1048,8 +1052,14 @@ cdef void fni_hybrid_free(fni_hybrid_state* h) noexcept nogil:
         free(h.masked)
     if h.t_probe != NULL:
         free(h.t_probe)
+    if h.t_fired != NULL:
+        free(h.t_fired)
+    if h.g_pending != NULL:
+        free(h.g_pending)
     h.masked = NULL
     h.t_probe = NULL
+    h.t_fired = NULL
+    h.g_pending = NULL
 
 
 cdef void fni_hybrid_unmask(fni_hybrid_state* h, Py_ssize_t n_events,
@@ -1061,6 +1071,58 @@ cdef void fni_hybrid_unmask(fni_hybrid_state* h, Py_ssize_t n_events,
         if h.masked[e] and g_new[e] != 0:
             h.masked[e] = False
         h.t_probe[e] = NAN
+
+
+cdef double _time_scale_ulps(const fni_solver* s, double t) noexcept nogil:
+    """A thousand ulps of the time scale at ``t``, in the direction of integration."""
+    cdef double delta = 1000 * EPS * (fabs(t) + (s.h_abs if s.h_abs < INFINITY else 0.0))
+    if delta == 0:
+        delta = 1000 * EPS
+    return delta * s.direction
+
+
+cdef int _find_coincident(fni_solver* s, fni_hybrid_state* h, const fni_event* events,
+                          Py_ssize_t n_events, Py_ssize_t event, double t_event,
+                          const double* y, const double* g) noexcept nogil:
+    """Note in ``h.g_pending`` the guards with a root at ``t_event`` too.
+
+    Such a guard is at zero or has changed sign since the start of the step, and it
+    had not changed sign just before. Without this its crossing is lost: the values
+    refreshed after the reset are already past it, or on zero, which is not a
+    crossing. A guard that fired at this instant does not count.
+    """
+    cdef Py_ssize_t i
+    cdef double delta = _time_scale_ulps(s, t_event)
+    cdef double value
+    cdef double* buf = NULL
+    cdef int rc = FNI_OK
+    for i in range(n_events):
+        h.g_pending[i] = NAN
+    for i in range(n_events):
+        if (i == event or h.masked[i] or fabs(t_event - h.t_fired[i]) <= fabs(delta)
+                or g[i] == 0):
+            continue
+        rc = events[i].fn(t_event, y, s.n, events[i].ctx, &value)
+        if rc != 0:
+            rc = FNI_ERR_CALLBACK
+            break
+        if value * g[i] > 0:
+            continue                  # on the near side of any root: the next step finds it
+        if buf == NULL:
+            buf = <double*> malloc(s.n * sizeof(double))
+            if buf == NULL:
+                rc = FNI_ERR_ALLOC
+                break
+        fni_solver_dense_eval(s, t_event - delta, buf)
+        rc = events[i].fn(t_event - delta, buf, s.n, events[i].ctx, &value)
+        if rc != 0:
+            rc = FNI_ERR_CALLBACK
+            break
+        if value * g[i] > 0:
+            h.g_pending[i] = g[i]
+    if buf != NULL:
+        free(buf)
+    return rc
 
 
 cdef int fni_hybrid_reset(fni_solver* s, fni_hybrid_state* h, const fni_hybrid_options* hopt,
@@ -1084,6 +1146,11 @@ cdef int fni_hybrid_reset(fni_solver* s, fni_hybrid_state* h, const fni_hybrid_o
     If the probe is still exactly zero (a tangential flow, or a guard that
     stays at zero), the guard is masked until a step ends with it away from
     zero. Its occurrence count restarts, so it fires on every later crossing.
+
+    Guards with a root at the same instant each fire once, in index order. One not
+    yet fired keeps its value from before the root, so the next step reports it
+    at once; one that has fired is probed again at every reset of that instant, or
+    round-off would let two of them re-trigger each other for ever.
     """
     cdef int rc
     cdef Py_ssize_t i
@@ -1099,6 +1166,9 @@ cdef int fni_hybrid_reset(fni_solver* s, fni_hybrid_state* h, const fni_hybrid_o
             and fabs(t_event - h.last_reset_t) < hopt.min_dwell):
         status[0] = FNI_STATUS_ZENO
         return FNI_OK
+    rc = _find_coincident(s, h, events, n_events, event, t_event, y, g)
+    if rc != FNI_OK:
+        return rc
     rc = reset(event, t_event, y, s.n, reset_ctx)
     if rc < 0:
         return FNI_ERR_CALLBACK
@@ -1116,22 +1186,24 @@ cdef int fni_hybrid_reset(fni_solver* s, fni_hybrid_state* h, const fni_hybrid_o
     rc = fni_events_eval(events, n_events, t_event, s.y, s.n, g)
     if rc != FNI_OK:
         return rc
-    for i in range(n_events):
-        h.t_probe[i] = NAN
-    delta = 1000 * EPS * (fabs(t_event) + (s.h_abs if s.h_abs < INFINITY else 0.0))
-    if delta == 0:
-        delta = 1000 * EPS
-    delta *= s.direction
+    h.t_fired[event] = t_event
+    delta = _time_scale_ulps(s, t_event)
     for i in range(s.n):
         s.y_new[i] = s.y[i] + delta * s.f[i]      # y_new is scratch until the next step
-    if events[event].fn(t_event + delta, s.y_new, s.n, events[event].ctx, &gp) != 0:
-        return FNI_ERR_CALLBACK
-    if gp != 0:
-        g[event] = gp
-        h.t_probe[event] = t_event + delta
-        h.masked[event] = False
-    else:
-        h.masked[event] = True
+    for i in range(n_events):
+        h.t_probe[i] = NAN
+        if h.g_pending[i] == h.g_pending[i] and h.g_pending[i] * g[i] <= 0:
+            g[i] = h.g_pending[i]                 # still past it: the next step reports it
+        if not fabs(t_event - h.t_fired[i]) <= fabs(delta):     # also when it never fired
+            continue
+        if events[i].fn(t_event + delta, s.y_new, s.n, events[i].ctx, &gp) != 0:
+            return FNI_ERR_CALLBACK
+        if gp != 0:
+            g[i] = gp
+            h.t_probe[i] = t_event + delta
+            h.masked[i] = False
+        else:
+            h.masked[i] = True
     return FNI_OK
 
 
@@ -1185,6 +1257,8 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
         n_resets[0] = 0
     h.masked = NULL
     h.t_probe = NULL
+    h.t_fired = NULL
+    h.g_pending = NULL
     scan.mem = NULL
 
     rc = fni_solver_init(&s, method, fun, ctx, n, t0, y0, t1, opt)
@@ -2329,6 +2403,8 @@ cdef object _drive(RungeKutta solver, double t0, object t_eval_obj,
 
     hst.masked = NULL
     hst.t_probe = NULL
+    hst.t_fired = NULL
+    hst.g_pending = NULL
     scan.mem = NULL
     _check(fni_event_scan_init(&scan, n_events, n))
     if is_hybrid:

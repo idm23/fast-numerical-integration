@@ -236,6 +236,8 @@ res.t_resets, res.y_before_resets, res.y_after_resets
   FNI probes it slightly later along the new flow, as SUNDIALS' root finder
   does, so it cannot fire again on that zero, while a real crossing later in
   the same step still fires.
+- **Guards with a root at the same instant** each fire once, in index order,
+  whether they are exactly tied or apart by round-off.
 - **Zeno behaviour:** `max_resets` (status -2) and `min_dwell` (status -3,
   two resets closer than this) end the integration cleanly instead of
   chattering forever.
