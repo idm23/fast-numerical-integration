@@ -68,13 +68,16 @@ ctypedef int (*fni_tangent_reset_fn)(Py_ssize_t event, double t, const double* y
 # The tangent X' = J(t, y(t)) X, advanced alongside an integration of y but not as
 # part of it: y is integrated by the chosen method with its own error control, and
 # after each accepted step (or the part of one before a reset) X is advanced over it
-# by the classical fourth-order Runge-Kutta scheme, with J at the step's ends and
-# middle and y there from the step's dense output. An embedded third-order (Kutta)
-# solution from the same Jacobians estimates X's error; a step whose estimate
-# exceeds (rtol, atol) is split, for X only, into 2, 4, ... pieces (at most
-# 2**max_depth). X approximates the solution of the variational equation, not the
-# derivative of the numerical flow of y. The Jacobian at a step's end is reused at
-# the next step's start, so a step costs two Jacobian evaluations.
+# by an explicit Runge-Kutta scheme, with J at fixed points of the step and y there
+# from the step's dense output: order 4 (classical RK4: J at the ends and middle, two
+# new evaluations per piece, Kutta's third-order solution as the error estimate) or
+# order 6 (Butcher's 7-stage method: J at 0, 1/3, 1/2, 2/3 and 1, four new
+# evaluations, classical RK4 from the same Jacobians as the estimate). A step whose
+# estimate exceeds (rtol, atol) is split, for X only, into 2, 4, ... pieces (at most
+# 2**max_depth); the estimate is that of the lower-order solution, so it is
+# pessimistic. X approximates the solution of the variational equation, not the
+# derivative of the numerical flow of y. The Jacobian at a piece's end is reused at
+# the next piece's start.
 cdef struct fni_tangent:
     fni_jacobian_fn jac
     void* ctx
@@ -85,6 +88,8 @@ cdef struct fni_tangent:
     double rtol
     double atol
     Py_ssize_t max_depth         # >= 0
+    int order                    # 4 (classical RK4, J at 3 points per piece) or 6
+                                 # (Butcher's 7-stage method, J at 5 points)
     fni_tangent_reset_fn reset   # NULL: X is continuous across resets
     void* reset_ctx
     Py_ssize_t n_jac             # out: Jacobian evaluations

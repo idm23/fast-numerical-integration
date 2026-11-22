@@ -317,6 +317,12 @@ the same results, bit for bit. `X' = J(t, y(t)) X` is advanced separately:
   continuous across the reset.
 - **Sparsity:** with a pattern for `J`, a native Jacobian writes only its
   nonzero values (CSR order), and each product costs one term per nonzero.
+- **Order 6** (`tangent_order=6`): Butcher's 7-stage sixth-order method, with `J`
+  at 0, 1/3, 1/2, 2/3 and 1 of a piece. That is four new Jacobian evaluations
+  per piece instead of two, for an error of order h^7 instead of h^5. Classical
+  RK4 from the same Jacobians is its error estimate. Both estimates measure the
+  lower-order solution, so they are pessimistic: set the tolerance above the
+  accuracy you need.
 
 ```python
 import numpy as np
@@ -340,7 +346,7 @@ converges with an approximate Jacobian.
 
 Where the scheme pays: when each step of `y` is short, for example between
 frequent events, so that `X` needs one or two pieces per step. Then the
-tangent costs about three Jacobian-sized evaluations per step, against one
+tangent costs two to five Jacobian evaluations per step, against one
 variational evaluation per stage (twelve for DOP853). On long, smooth steps a
 fourth-order `X` needs many pieces, and appending `X` to the state is the
 better choice.

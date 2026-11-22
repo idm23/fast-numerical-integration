@@ -182,3 +182,21 @@ def test_native_callbacks_run_without_the_gil():
     assert np.abs(r.X - expm(3.0 * A)).max() < 1e-7
     with pytest.raises(TypeError):
         integrate_tangent(system, (0.0, 3.0), [1.0, 0.0], lambda t, y: A, release_gil=True)
+
+
+def test_sixth_order_is_more_accurate_per_piece():
+    exact = expm(3.0 * A)
+    kw = dict(rtol=1e-10, atol=1e-12, max_depth=0)
+    four = integrate_tangent(damped, (0.0, 3.0), [1.0, 0.0], lambda t, y: A, tangent_order=4, **kw)
+    six = integrate_tangent(damped, (0.0, 3.0), [1.0, 0.0], lambda t, y: A, tangent_order=6, **kw)
+    assert four.n_tangent_pieces == six.n_tangent_pieces == six.n_accepted
+    # Four new Jacobians per piece against two.
+    assert six.n_jac == 4 * six.n_tangent_pieces + 1
+    assert np.abs(six.X - exact).max() < 0.05 * np.abs(four.X - exact).max()
+    # On the nonlinear flow and across a reset too.
+    fd = flow_jacobian_fd(vdp, 4.0, [2.0, 0.0])
+    r = integrate_tangent(vdp, (0.0, 4.0), [2.0, 0.0], vdp_jac, rtol=1e-10, atol=1e-12,
+                          tangent_order=6, tangent_rtol=1e-9, tangent_atol=1e-11)
+    assert np.abs(r.X - fd).max() < 1e-6 * max(1.0, np.abs(fd).max())
+    with pytest.raises(ValueError):
+        integrate_tangent(damped, (0.0, 1.0), [1.0, 0.0], lambda t, y: A, tangent_order=5)

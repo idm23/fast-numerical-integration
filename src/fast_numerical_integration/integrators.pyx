@@ -1266,7 +1266,14 @@ cdef struct _tangent_work:
     double* k3
     double* k4
     double* k5
+    double* k6
+    double* k7
+    double* r2               # the order-6 scheme's embedded RK4 stages
+    double* r3
+    double* r4
     double* tmp
+    double* J13              # order 6: J at 1/3 and 2/3 of a piece
+    double* J23
     double* y_node
     double* y_before         # the state just before a reset
     double t_tan             # X is advanced up to here
@@ -1274,8 +1281,8 @@ cdef struct _tangent_work:
 
 
 cdef void fni_tangent_init(fni_tangent* tg) noexcept nogil:
-    """Defaults: dense J, rtol 1e-8, atol 1e-10, max_depth 4, no tangent reset, counts
-    zeroed. Set ``jac`` (and ``ctx``), ``m`` and ``X`` before use."""
+    """Defaults: dense J, order 4, rtol 1e-8, atol 1e-10, max_depth 4, no tangent
+    reset, counts zeroed. Set ``jac`` (and ``ctx``), ``m`` and ``X`` before use."""
     tg.jac = NULL
     tg.ctx = NULL
     tg.m = 0
@@ -1285,6 +1292,7 @@ cdef void fni_tangent_init(fni_tangent* tg) noexcept nogil:
     tg.rtol = 1e-8
     tg.atol = 1e-10
     tg.max_depth = 4
+    tg.order = 4
     tg.reset = NULL
     tg.reset_ctx = NULL
     tg.n_jac = 0
@@ -1295,7 +1303,8 @@ cdef Py_ssize_t _tangent_mem_size(const fni_tangent* tg, Py_ssize_t n) noexcept 
     """Doubles the tangent's work takes, or -1 for invalid arguments."""
     cdef Py_ssize_t nm, nnz
     if tg.jac == NULL or tg.m < 0 or tg.max_depth < 0 or not (tg.rtol >= 0) or not (
-            tg.atol >= 0) or (tg.row_ptr == NULL) != (tg.col_idx == NULL):
+            tg.atol >= 0) or (tg.row_ptr == NULL) != (tg.col_idx == NULL) or not (
+            tg.order == 4 or tg.order == 6):
         return -1
     nm = n * tg.m
     if nm > 0 and tg.X == NULL:
@@ -1303,7 +1312,7 @@ cdef Py_ssize_t _tangent_mem_size(const fni_tangent* tg, Py_ssize_t n) noexcept 
     nnz = tg.row_ptr[n] if tg.row_ptr != NULL else n * n
     if nnz < 0:
         return -1
-    return 4 * nnz + 7 * nm + 2 * n + 1
+    return 6 * nnz + 12 * nm + 2 * n + 1
 
 
 cdef void _tangent_work_init(_tangent_work* w, const fni_tangent* tg, Py_ssize_t n,
@@ -1322,8 +1331,15 @@ cdef void _tangent_work_init(_tangent_work* w, const fni_tangent* tg, Py_ssize_t
     w.k3 = w.k2 + nm
     w.k4 = w.k3 + nm
     w.k5 = w.k4 + nm
-    w.tmp = w.k5 + nm
-    w.y_node = w.tmp + nm
+    w.k6 = w.k5 + nm
+    w.k7 = w.k6 + nm
+    w.r2 = w.k7 + nm
+    w.r3 = w.r2 + nm
+    w.r4 = w.r3 + nm
+    w.tmp = w.r4 + nm
+    w.J13 = w.tmp + nm
+    w.J23 = w.J13 + w.nnz
+    w.y_node = w.J23 + w.nnz
     w.y_before = w.y_node + n
     w.t_tan = t0
     w.have_ja = False
@@ -1412,6 +1428,69 @@ cdef int _tangent_piece(const fni_solver* s, fni_tangent* tg, _tangent_work* w, 
     return FNI_OK
 
 
+cdef int _tangent_piece6(const fni_solver* s, fni_tangent* tg, _tangent_work* w, double a,
+                         double b, const double* Ja, double* err) noexcept nogil:
+    """Advance X over [a, b] by Butcher's 7-stage sixth-order method (J at 1/3, 2/3,
+    1/2 and the end evaluated into w.J13, w.J23, w.Jm, w.Jn). ``err`` receives the
+    RMS of it against classical RK4 from the same Jacobians, scaled by (rtol, atol)."""
+    cdef Py_ssize_t n = s.n, nm = s.n * tg.m, i
+    cdef double h = b - a, d, sc, acc = 0.0, x6, x4
+    cdef double* X = tg.X
+    cdef int rc = _tangent_jac(s, tg, w, a + h / 3.0, w.J13)
+    if rc == FNI_OK:
+        rc = _tangent_jac(s, tg, w, a + 2.0 * h / 3.0, w.J23)
+    if rc == FNI_OK:
+        rc = _tangent_jac(s, tg, w, 0.5 * (a + b), w.Jm)
+    if rc == FNI_OK:
+        rc = _tangent_jac(s, tg, w, b, w.Jn)
+    if rc != FNI_OK:
+        return rc
+    _tangent_mul(tg, n, Ja, X, w.k1)
+    for i in range(nm):
+        w.tmp[i] = X[i] + h / 3.0 * w.k1[i]
+    _tangent_mul(tg, n, w.J13, w.tmp, w.k2)
+    for i in range(nm):
+        w.tmp[i] = X[i] + h * 2.0 / 3.0 * w.k2[i]
+    _tangent_mul(tg, n, w.J23, w.tmp, w.k3)
+    for i in range(nm):
+        w.tmp[i] = X[i] + h * (w.k1[i] / 12.0 + w.k2[i] / 3.0 - w.k3[i] / 12.0)
+    _tangent_mul(tg, n, w.J13, w.tmp, w.k4)
+    for i in range(nm):
+        w.tmp[i] = X[i] + h * (-w.k1[i] / 16.0 + 9.0 / 8.0 * w.k2[i]
+                               - 3.0 / 16.0 * w.k3[i] - 3.0 / 8.0 * w.k4[i])
+    _tangent_mul(tg, n, w.Jm, w.tmp, w.k5)
+    for i in range(nm):
+        w.tmp[i] = X[i] + h * (9.0 / 8.0 * w.k2[i] - 3.0 / 8.0 * w.k3[i] - 0.75 * w.k4[i]
+                               + 0.5 * w.k5[i])
+    _tangent_mul(tg, n, w.Jm, w.tmp, w.k6)
+    for i in range(nm):
+        w.tmp[i] = X[i] + h * (9.0 / 44.0 * w.k1[i] - 9.0 / 11.0 * w.k2[i]
+                               + 63.0 / 44.0 * w.k3[i] + 18.0 / 11.0 * w.k4[i]
+                               - 16.0 / 11.0 * w.k6[i])
+    _tangent_mul(tg, n, w.Jn, w.tmp, w.k7)
+    # Classical RK4 from J(a), J(middle) and J(b): the error estimate.
+    for i in range(nm):
+        w.tmp[i] = X[i] + 0.5 * h * w.k1[i]
+    _tangent_mul(tg, n, w.Jm, w.tmp, w.r2)
+    for i in range(nm):
+        w.tmp[i] = X[i] + 0.5 * h * w.r2[i]
+    _tangent_mul(tg, n, w.Jm, w.tmp, w.r3)
+    for i in range(nm):
+        w.tmp[i] = X[i] + h * w.r3[i]
+    _tangent_mul(tg, n, w.Jn, w.tmp, w.r4)
+    for i in range(nm):
+        x6 = X[i] + h * (11.0 / 120.0 * (w.k1[i] + w.k7[i])
+                         + 27.0 / 40.0 * (w.k3[i] + w.k4[i])
+                         - 4.0 / 15.0 * (w.k5[i] + w.k6[i]))
+        x4 = X[i] + h / 6.0 * (w.k1[i] + 2.0 * w.r2[i] + 2.0 * w.r3[i] + w.r4[i])
+        sc = tg.atol + tg.rtol * (fabs(X[i]) if fabs(X[i]) > fabs(x6) else fabs(x6))
+        d = (x6 - x4) / sc if sc > 0 else (0.0 if x6 == x4 else INFINITY)
+        acc += d * d
+        X[i] = x6
+    err[0] = sqrt(acc / nm) if nm > 0 else 0.0
+    return FNI_OK
+
+
 cdef int _tangent_advance(const fni_solver* s, fni_tangent* tg, _tangent_work* w,
                           double b) noexcept nogil:
     """Advance X from w.t_tan to ``b``, both in the current step (dense output valid).
@@ -1439,7 +1518,10 @@ cdef int _tangent_advance(const fni_solver* s, fni_tangent* tg, _tangent_work* w
         worst = 0.0
         for q in range(pieces):
             tb = b if q == pieces - 1 else a + (b - a) * (q + 1) / pieces
-            rc = _tangent_piece(s, tg, w, ta, tb, w.Jb, &err)
+            if tg.order == 6:
+                rc = _tangent_piece6(s, tg, w, ta, tb, w.Jb, &err)
+            else:
+                rc = _tangent_piece(s, tg, w, ta, tb, w.Jb, &err)
             if rc != FNI_OK:
                 return rc
             tg.n_pieces += 1
@@ -3277,7 +3359,8 @@ def integrate_hybrid(fun, t_span, y0, events, reset, method="RK45", *, rtol=1e-3
 
 def integrate_tangent(fun, t_span, y0, jac, X0=None, method="DOP853", *, rtol=1e-3,
                       atol=1e-6, tangent_rtol=1e-8, tangent_atol=1e-10, max_depth=4,
-                      sparsity=None, events=None, reset=None, tangent_reset=None,
+                      tangent_order=4, sparsity=None, events=None, reset=None,
+                      tangent_reset=None,
                       first_step=None, max_step=np.inf, args=None, max_resets=10000,
                       min_dwell=0.0, reselect_step=False, max_records=1024,
                       release_gil=None, event_detection="endpoints", n_interior=4):
@@ -3293,7 +3376,10 @@ def integrate_tangent(fun, t_span, y0, jac, X0=None, method="DOP853", *, rtol=1e
     end value is reused at the next step's start: two Jacobian evaluations per step.
     An embedded third-order solution estimates the error of ``X``. Where it exceeds
     ``(tangent_rtol, tangent_atol)``, the step is split for ``X`` only, into up to
-    ``2**max_depth`` pieces. ``y`` is unaffected by ``X``.
+    ``2**max_depth`` pieces. ``y`` is unaffected by ``X``. With ``tangent_order=6``,
+    Butcher's 7-stage sixth-order method replaces RK4: ``J`` at 0, 1/3, 1/2, 2/3 and 1
+    of a piece (four new evaluations), with RK4 from the same Jacobians as the error
+    estimate. The estimate is the lower-order solution's, so it is pessimistic.
 
     ``X`` approximates the solution of the variational equation, not the derivative
     of the numerical flow of ``y``. It is not part of ``y``'s error control, and it
@@ -3325,7 +3411,8 @@ def integrate_tangent(fun, t_span, y0, jac, X0=None, method="DOP853", *, rtol=1e
     return _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events, args,
                       max_records, release_gil, reset, hybrid, event_detection, n_interior,
                       {"jac": jac, "X0": X0, "sparsity": sparsity, "reset": tangent_reset,
-                       "rtol": tangent_rtol, "atol": tangent_atol, "max_depth": max_depth})
+                       "rtol": tangent_rtol, "atol": tangent_atol, "max_depth": max_depth,
+                       "order": tangent_order})
 
 
 cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events,
@@ -3462,6 +3549,9 @@ cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step
         tg.rtol = float(tangent["rtol"])
         tg.atol = float(tangent["atol"])
         tg.max_depth = int(tangent["max_depth"])
+        tg.order = int(tangent["order"])
+        if tg.order not in (4, 6):
+            raise ValueError("`tangent_order` must be 4 or 6")
         tgp = &tg
     if release_gil is None:
         release_gil = nogil_ok
