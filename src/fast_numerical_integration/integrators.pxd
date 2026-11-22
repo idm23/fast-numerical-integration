@@ -48,6 +48,48 @@ cdef enum:
     FNI_RESET_CONTINUE = 0
     FNI_RESET_STOP = 1
 
+# Decoupled tangent propagator (fni_integrate_hybrid_tangent).
+#
+# Jacobian J = df/dy at (t, y; ctx). Write it into J: dense row-major n x n, or,
+# when the tangent carries a sparsity pattern, its nonzero values in the pattern's
+# CSR order. Return 0 on success, nonzero on failure (FNI_ERR_CALLBACK).
+ctypedef int (*fni_jacobian_fn)(double t, const double* y, Py_ssize_t n, void* ctx,
+                                double* J) noexcept nogil
+
+# Tangent reset, called after the reset map of terminal event ``event`` at ``t``:
+# ``y_before`` and ``y_after`` are the states on either side of the reset; map the
+# tangent ``X`` (n x m, row-major) across the jump in place (for a flow's
+# sensitivities, X <- S X with the saltation matrix S). Return 0, or nonzero on
+# failure (FNI_ERR_CALLBACK).
+ctypedef int (*fni_tangent_reset_fn)(Py_ssize_t event, double t, const double* y_before,
+                                     const double* y_after, double* X, Py_ssize_t n,
+                                     Py_ssize_t m, void* ctx) noexcept nogil
+
+# The tangent X' = J(t, y(t)) X, advanced alongside an integration of y but not as
+# part of it: y is integrated by the chosen method with its own error control, and
+# after each accepted step (or the part of one before a reset) X is advanced over it
+# by the classical fourth-order Runge-Kutta scheme, with J at the step's ends and
+# middle and y there from the step's dense output. An embedded third-order (Kutta)
+# solution from the same Jacobians estimates X's error; a step whose estimate
+# exceeds (rtol, atol) is split, for X only, into 2, 4, ... pieces (at most
+# 2**max_depth). X approximates the solution of the variational equation, not the
+# derivative of the numerical flow of y. The Jacobian at a step's end is reused at
+# the next step's start, so a step costs two Jacobian evaluations.
+cdef struct fni_tangent:
+    fni_jacobian_fn jac
+    void* ctx
+    Py_ssize_t m                 # columns of X
+    double* X                    # n x m row-major: X(t0) on entry, X(t_final) on exit
+    const Py_ssize_t* row_ptr    # CSR pattern of J (n + 1 offsets), or NULL: dense J
+    const Py_ssize_t* col_idx    # row_ptr[n] column indices
+    double rtol
+    double atol
+    Py_ssize_t max_depth         # >= 0
+    fni_tangent_reset_fn reset   # NULL: X is continuous across resets
+    void* reset_ctx
+    Py_ssize_t n_jac             # out: Jacobian evaluations
+    Py_ssize_t n_pieces          # out: tangent pieces (one per step without splits)
+
 cdef enum:
     # methods
     FNI_RK23 = 0
@@ -238,6 +280,19 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
                               double* record_y, double* record_y_after, bint* record_reset,
                               Py_ssize_t max_records,
                               fni_stats* stats, Py_ssize_t* n_resets) noexcept nogil
+cdef void fni_tangent_init(fni_tangent* tg) noexcept nogil
+cdef int fni_integrate_hybrid_tangent(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
+                                      double t0, const double* y0, double t1,
+                                      const fni_options* opt,
+                                      const fni_event* events, Py_ssize_t n_events,
+                                      fni_reset_fn reset, void* reset_ctx,
+                                      const fni_hybrid_options* hopt,
+                                      double* y_out, Py_ssize_t* record_event,
+                                      double* record_t, double* record_y,
+                                      double* record_y_after, bint* record_reset,
+                                      Py_ssize_t max_records,
+                                      fni_stats* stats, Py_ssize_t* n_resets,
+                                      fni_tangent* tangent) noexcept nogil
 cdef int fni_integrate(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
                        double t0, const double* y0, double t1, const fni_options* opt,
                        const fni_event* events, Py_ssize_t n_events,
@@ -301,6 +356,25 @@ cdef class ResetMap:
     # Overwrite y with the post-event state; return FNI_RESET_CONTINUE or
     # FNI_RESET_STOP, or -1 with an exception set.
     cdef int eval(self, Py_ssize_t event, double t, double* y, Py_ssize_t n) except -1
+
+
+cdef class Jacobian:
+    # Optional GIL-free implementation (see fni_jacobian_fn); otherwise override eval.
+    cdef fni_jacobian_fn c_fn
+    cdef void* c_ctx
+
+    # Write J = df/dy at (t, y) into J (dense n x n, or the pattern's values).
+    cdef int eval(self, double t, const double* y, Py_ssize_t n, double* J) except -1
+
+
+cdef class TangentReset:
+    # Optional GIL-free implementation (see fni_tangent_reset_fn); otherwise override eval.
+    cdef fni_tangent_reset_fn c_fn
+    cdef void* c_ctx
+
+    # Overwrite X (n x m, row-major) with the tangent after the reset.
+    cdef int eval(self, Py_ssize_t event, double t, const double* y_before,
+                  const double* y_after, double* X, Py_ssize_t n, Py_ssize_t m) except -1
 
 
 cdef class RungeKutta:

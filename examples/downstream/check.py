@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from downstream_kernels.osc import Oscillator, endpoint
+from downstream_kernels.osc import Oscillator, endpoint, endpoint_tangent
 from fast_numerical_integration.integrators import integrate, solve_ivp
 
 osc = Oscillator(4.0)
@@ -14,4 +14,9 @@ assert abs(x - np.cos(6.0)) < 1e-9
 assert integrate(osc, (0.0, 3.0), [1.0, 0.0]).gil_released
 osc.params = [9.0]
 assert abs(solve_ivp(osc, (0.0, 1.0), [1.0, 0.0], rtol=1e-10, atol=1e-12).y[0, -1] - np.cos(3.0)) < 1e-8
+(xt, vt), X, n_jac = endpoint_tangent(4.0, 3.0)
+assert (xt, vt) == (x, v), "the tangent changed the state's integration"
+c, s_ = np.cos(6.0), np.sin(6.0)
+assert np.abs(np.array(X) - np.array([[c, s_ / 2.0], [-2.0 * s_, c]])).max() < 1e-6
+assert n_jac > 0
 print("downstream cimport of the C API: OK")
