@@ -72,7 +72,7 @@ jobs:
       fail-fast: false
       matrix:
         # Wheels only for the platforms in use. Others install from the sdist
-        # (needs a C compiler, which auto-optimal-control users have anyway).
+        # (needs a C compiler).
         # Adding a platform is one line: ubuntu-24.04-arm (Linux aarch64),
         # macos-15-intel (macOS x86_64) or windows-latest.
         os:

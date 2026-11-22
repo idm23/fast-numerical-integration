@@ -1,8 +1,7 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, initializedcheck=False
 """Native N-body gravity right-hand side for the Cython integrators.
 
-A hand-written stand-in for the SymPy-generated C kernel planned for later
-milestones. It uses the same packed state layout as
+A hand-written native right-hand side. It uses the same packed state layout as
 :mod:`fast_numerical_integration.three_body`::
 
     y = [ r_1 (d), ..., r_N (d),  v_1 (d), ..., v_N (d) ]

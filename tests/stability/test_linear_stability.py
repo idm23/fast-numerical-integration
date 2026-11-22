@@ -74,7 +74,7 @@ def test_step_size_rides_the_stability_boundary(method, lam):
     hl = np.abs(np.diff(sol.t)) * abs(lam)
     late = hl[len(hl) // 2:]
     assert np.median(late) == pytest.approx(x_star, rel=0.05)
-    # Riding the boundary is stable: the smooth solution is still tracked.
+    # Steps at the stability limit stay stable: the smooth solution is still tracked.
     assert np.max(np.abs(sol.y[0] - np.cos(sol.t))) < 1e-2
     # The work therefore scales with |lambda|, not with the tolerance.
     assert sol.nfev > 0.5 * 10.0 * abs(lam) / x_star

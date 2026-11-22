@@ -2743,7 +2743,7 @@ def solve_hybrid(fun, t_span, y0, events, reset, method="RK45", t_eval=None,
     When one fires, ``reset`` maps the state across it and integration
     continues from the event, in the same solver and with the step size
     carried over. Non-terminal events are only recorded, as in ``solve_ivp``.
-    The flow may depend on a discrete mode (a bang-bang arc, a contact state)
+    The flow may depend on a discrete mode (a switched controller, a contact state)
     that ``reset`` updates. Keep the mode in an object the system and the
     reset map share.
 

@@ -420,9 +420,8 @@ require before merging.
 - [x] **Milestone 3f** — Event detection inside a step: roots split the step
       for the other events, opt-in interior test points
       (`event_detection="interior"`), `fni_options_init` (0.4.0).
-- SymPy code generation lives in the companion package
-  [auto-optimal-control](https://github.com/idm23/auto-optimal-control),
-  which builds its compiled kernels on this C API.
+- Code generation is out of scope: a downstream package that generates its
+  right-hand sides (for example with SymPy) builds them on this C API.
 
 ## Releasing
 
