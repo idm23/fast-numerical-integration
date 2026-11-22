@@ -3,8 +3,7 @@
 
 Each class mirrors a NumPy RHS in :mod:`fast_numerical_integration.problems.catalog`
 and is checked against it in the tests. Every one is a GIL-free C function
-(``c_fn``) plus a context, the same shape the SymPy-generated kernels will
-have. Physical constants are runtime parameters (``system.params``), so
+(``c_fn``) plus a context, the shape a generated kernel has too. Physical constants are runtime parameters (``system.params``), so
 continuation in them needs no recompilation. The kernels are reentrant (no
 shared scratch), so one system object can be integrated from several threads.
 """
@@ -13,7 +12,7 @@ from libc.math cimport cos, sin, sqrt
 
 import numpy as np
 
-from fast_numerical_integration.integrators cimport EventFunction, OdeSystem
+from fast_numerical_integration.integrators cimport EventFunction, Jacobian, OdeSystem
 
 cdef enum:
     MAX_PLANETS = 32
@@ -65,6 +64,33 @@ cdef class LinearSystem(OdeSystem):
         self.data.A = &self.A[0, 0]
         self.data.b = &self.b[0]
         _bind(self, _linear_fn, &self.data)
+
+
+cdef int _linear_jac_fn(double t, const double* y, Py_ssize_t n, void* ctx,
+                        double* J) noexcept nogil:
+    cdef _linear_ctx* c = <_linear_ctx*> ctx
+    cdef Py_ssize_t i
+    for i in range(n * n):
+        J[i] = c.A[i]
+    return 0
+
+
+cdef class LinearJacobian(Jacobian):
+    """The constant Jacobian ``A`` of :class:`LinearSystem` (dense), GIL-free."""
+
+    cdef double[:, ::1] A
+    cdef _linear_ctx data
+
+    def __init__(self, A):
+        A = np.array(A, dtype=np.float64, copy=True)
+        if A.ndim != 2 or A.shape[0] != A.shape[1] or A.shape[0] == 0:
+            raise ValueError("A must be square and non-empty")
+        self.A = A
+        self.data.n = A.shape[0]
+        self.data.A = &self.A[0, 0]
+        self.data.b = NULL
+        self.c_fn = _linear_jac_fn
+        self.c_ctx = &self.data
 
 
 cdef int _quadratic_fn(double t, const double* y, double* dydt, Py_ssize_t n, void* ctx) noexcept nogil:
