@@ -279,19 +279,38 @@ cdef int fni_solver_init(fni_solver* s, int method, fni_rhs_fn fun, void* ctx, P
     Always call :func:`fni_solver_free` afterwards, even if this fails.
     """
     cdef const fni_tableau* tab = fni_get_tableau(method)
-    cdef Py_ssize_t i, total
-    cdef double r, a
+    cdef Py_ssize_t total
+    cdef double* mem
     s.mem = NULL
-    if tab == NULL or n < 0 or fun == NULL or not (opt.max_step > 0):
+    if tab == NULL or n < 0:
+        return FNI_ERR_ARG
+    total = _solver_mem_size(tab, n)
+    mem = <double*> malloc(total * sizeof(double))
+    if mem == NULL:
+        return FNI_ERR_ALLOC
+    s.mem = mem                  # owned: fni_solver_free releases it
+    return _solver_init_on(s, tab, fun, ctx, n, t0, y0, t_bound, opt, mem)
+
+
+cdef inline Py_ssize_t _solver_mem_size(const fni_tableau* tab, Py_ssize_t n) noexcept nogil:
+    """Doubles a solver's buffers take (at least one)."""
+    cdef Py_ssize_t total = (8 + tab.n_k_rows + tab.n_dense_coef) * n
+    return total if total > 0 else 1
+
+
+cdef int _solver_init_on(fni_solver* s, const fni_tableau* tab, fni_rhs_fn fun, void* ctx,
+                         Py_ssize_t n, double t0, const double* y0, double t_bound,
+                         const fni_options* opt, double* mem) noexcept nogil:
+    """:func:`fni_solver_init` on caller-provided memory of ``_solver_mem_size``
+    doubles (``s.mem`` is left as the caller set it: NULL when not owned)."""
+    cdef Py_ssize_t i
+    cdef double r, a
+    if n < 0 or fun == NULL or not (opt.max_step > 0):
         return FNI_ERR_ARG
     if not (opt.event_detection == FNI_EVENTS_ENDPOINTS or (
             opt.event_detection == FNI_EVENTS_INTERIOR and opt.n_interior >= 1)):
         return FNI_ERR_ARG
-    total = (8 + tab.n_k_rows + tab.n_dense_coef) * n
-    s.mem = <double*> malloc((total if total > 0 else 1) * sizeof(double))
-    if s.mem == NULL:
-        return FNI_ERR_ALLOC
-    s.y = s.mem
+    s.y = mem
     s.y_old = s.y + n
     s.f = s.y_old + n
     s.y_new = s.f + n
@@ -797,12 +816,25 @@ cdef void fni_options_init(fni_options* opt) noexcept nogil:
 cdef int fni_event_scan_init(fni_event_scan* sc, Py_ssize_t n_events,
                              Py_ssize_t n) noexcept nogil:
     """Allocate the scan scratch; call :func:`fni_event_scan_free` afterwards."""
-    cdef Py_ssize_t m = n_events if n_events > 0 else 1
-    sc.n_events = n_events
-    sc.mem = <double*> malloc((7 * m + (n if n > 0 else 1)) * sizeof(double))
+    sc.mem = <double*> malloc(_scan_mem_size(n_events, n) * sizeof(double))
     if sc.mem == NULL:
         return FNI_ERR_ALLOC
-    sc.ga = sc.mem
+    _scan_init_on(sc, n_events, n, sc.mem)
+    return FNI_OK
+
+
+cdef inline Py_ssize_t _scan_mem_size(Py_ssize_t n_events, Py_ssize_t n) noexcept nogil:
+    cdef Py_ssize_t m = n_events if n_events > 0 else 1
+    return 7 * m + (n if n > 0 else 1)
+
+
+cdef void _scan_init_on(fni_event_scan* sc, Py_ssize_t n_events, Py_ssize_t n,
+                        double* mem) noexcept nogil:
+    """The scan scratch on ``_scan_mem_size`` doubles at ``mem`` (``sc.mem`` is left
+    as the caller set it)."""
+    cdef Py_ssize_t m = n_events if n_events > 0 else 1
+    sc.n_events = n_events
+    sc.ga = mem
     sc.ta = sc.ga + m
     sc.gb = sc.ta + m
     sc.gr = sc.gb + m
@@ -813,7 +845,6 @@ cdef int fni_event_scan_init(fni_event_scan* sc, Py_ssize_t n_events,
     sc.g_end = NULL
     sc.i_point = 0
     sc.n_points = 0
-    return FNI_OK
 
 
 cdef void fni_event_scan_free(fni_event_scan* sc) noexcept nogil:
@@ -1030,32 +1061,42 @@ cdef int fni_events_next(fni_solver* s, const fni_event* events, Py_ssize_t n_ev
 
 cdef int fni_hybrid_init(fni_hybrid_state* h, Py_ssize_t n_events) noexcept nogil:
     """Set up guard bookkeeping; call :func:`fni_hybrid_free` afterwards."""
-    cdef Py_ssize_t e
+    cdef double* mem = <double*> malloc(_hybrid_mem_size(n_events) * sizeof(double))
+    h.masked = NULL
+    h.t_probe = NULL
+    h.t_fired = NULL
+    h.g_pending = NULL
+    if mem == NULL:
+        return FNI_ERR_ALLOC
+    _hybrid_init_on(h, n_events, mem)      # owned: one block, based at t_probe
+    return FNI_OK
+
+
+cdef inline Py_ssize_t _hybrid_mem_size(Py_ssize_t n_events) noexcept nogil:
+    """Doubles the guard bookkeeping takes: three per event, then the masks."""
+    cdef Py_ssize_t m = n_events if n_events > 0 else 1
+    return 3 * m + (m * sizeof(bint) + sizeof(double) - 1) // sizeof(double)
+
+
+cdef void _hybrid_init_on(fni_hybrid_state* h, Py_ssize_t n_events, double* mem) noexcept nogil:
+    """Guard bookkeeping on ``_hybrid_mem_size`` doubles at ``mem``."""
+    cdef Py_ssize_t e, m = n_events if n_events > 0 else 1
     h.n_resets = 0
     h.last_reset_t = NAN
-    h.masked = <bint*> malloc((n_events if n_events > 0 else 1) * sizeof(bint))
-    h.t_probe = <double*> malloc((n_events if n_events > 0 else 1) * sizeof(double))
-    h.t_fired = <double*> malloc((n_events if n_events > 0 else 1) * sizeof(double))
-    h.g_pending = <double*> malloc((n_events if n_events > 0 else 1) * sizeof(double))
-    if h.masked == NULL or h.t_probe == NULL or h.t_fired == NULL or h.g_pending == NULL:
-        return FNI_ERR_ALLOC
+    h.t_probe = mem
+    h.t_fired = mem + m
+    h.g_pending = mem + 2 * m
+    h.masked = <bint*> (mem + 3 * m)
     for e in range(n_events):
         h.masked[e] = False
         h.t_probe[e] = NAN
         h.t_fired[e] = NAN
         h.g_pending[e] = NAN
-    return FNI_OK
 
 
 cdef void fni_hybrid_free(fni_hybrid_state* h) noexcept nogil:
-    if h.masked != NULL:
-        free(h.masked)
     if h.t_probe != NULL:
-        free(h.t_probe)
-    if h.t_fired != NULL:
-        free(h.t_fired)
-    if h.g_pending != NULL:
-        free(h.g_pending)
+        free(h.t_probe)          # the block from fni_hybrid_init
     h.masked = NULL
     h.t_probe = NULL
     h.t_fired = NULL
@@ -1207,6 +1248,214 @@ cdef int fni_hybrid_reset(fni_solver* s, fni_hybrid_state* h, const fni_hybrid_o
     return FNI_OK
 
 
+
+# -----------------------------------------------------------------------------
+# Decoupled tangent propagator
+# -----------------------------------------------------------------------------
+
+cdef struct _tangent_work:
+    double* mem
+    Py_ssize_t nnz           # entries of one Jacobian (n * n dense, or the pattern's)
+    double* Ja               # J at t_tan (valid when have_ja)
+    double* Jm               # J at a piece's middle
+    double* Jb               # J at the start of the current piece
+    double* Jn               # J at a piece's end
+    double* x0               # X at the start of the interval (for retries)
+    double* k1
+    double* k2
+    double* k3
+    double* k4
+    double* k5
+    double* tmp
+    double* y_node
+    double* y_before         # the state just before a reset
+    double t_tan             # X is advanced up to here
+    bint have_ja
+
+
+cdef void fni_tangent_init(fni_tangent* tg) noexcept nogil:
+    """Defaults: dense J, rtol 1e-8, atol 1e-10, max_depth 4, no tangent reset, counts
+    zeroed. Set ``jac`` (and ``ctx``), ``m`` and ``X`` before use."""
+    tg.jac = NULL
+    tg.ctx = NULL
+    tg.m = 0
+    tg.X = NULL
+    tg.row_ptr = NULL
+    tg.col_idx = NULL
+    tg.rtol = 1e-8
+    tg.atol = 1e-10
+    tg.max_depth = 4
+    tg.reset = NULL
+    tg.reset_ctx = NULL
+    tg.n_jac = 0
+    tg.n_pieces = 0
+
+
+cdef Py_ssize_t _tangent_mem_size(const fni_tangent* tg, Py_ssize_t n) noexcept nogil:
+    """Doubles the tangent's work takes, or -1 for invalid arguments."""
+    cdef Py_ssize_t nm, nnz
+    if tg.jac == NULL or tg.m < 0 or tg.max_depth < 0 or not (tg.rtol >= 0) or not (
+            tg.atol >= 0) or (tg.row_ptr == NULL) != (tg.col_idx == NULL):
+        return -1
+    nm = n * tg.m
+    if nm > 0 and tg.X == NULL:
+        return -1
+    nnz = tg.row_ptr[n] if tg.row_ptr != NULL else n * n
+    if nnz < 0:
+        return -1
+    return 4 * nnz + 7 * nm + 2 * n + 1
+
+
+cdef void _tangent_work_init(_tangent_work* w, const fni_tangent* tg, Py_ssize_t n,
+                             double t0, double* mem) noexcept nogil:
+    """The tangent's work on ``_tangent_mem_size`` doubles at ``mem``."""
+    cdef Py_ssize_t nm = n * tg.m
+    w.mem = mem
+    w.nnz = tg.row_ptr[n] if tg.row_ptr != NULL else n * n
+    w.Ja = mem
+    w.Jm = w.Ja + w.nnz
+    w.Jb = w.Jm + w.nnz
+    w.Jn = w.Jb + w.nnz
+    w.x0 = w.Jn + w.nnz
+    w.k1 = w.x0 + nm
+    w.k2 = w.k1 + nm
+    w.k3 = w.k2 + nm
+    w.k4 = w.k3 + nm
+    w.k5 = w.k4 + nm
+    w.tmp = w.k5 + nm
+    w.y_node = w.tmp + nm
+    w.y_before = w.y_node + n
+    w.t_tan = t0
+    w.have_ja = False
+
+
+cdef inline void _tangent_mul(const fni_tangent* tg, Py_ssize_t n, const double* J,
+                              const double* X, double* out) noexcept nogil:
+    """out = J X, with X and out n x m row-major and J dense or on the CSR pattern."""
+    cdef Py_ssize_t i, j, k, p, m = tg.m
+    cdef double a
+    cdef double* row
+    cdef const double* xk
+    for i in range(n):
+        row = out + i * m
+        for j in range(m):
+            row[j] = 0.0
+        if tg.row_ptr == NULL:
+            for k in range(n):
+                a = J[i * n + k]
+                if a != 0.0:
+                    xk = X + k * m
+                    for j in range(m):
+                        row[j] += a * xk[j]
+        else:
+            for p in range(tg.row_ptr[i], tg.row_ptr[i + 1]):
+                a = J[p]
+                if a != 0.0:
+                    xk = X + tg.col_idx[p] * m
+                    for j in range(m):
+                        row[j] += a * xk[j]
+
+
+cdef inline void _y_at(const fni_solver* s, double t, double* out) noexcept nogil:
+    """The state at ``t`` in the current step: its ends exactly, else dense output."""
+    if t == s.t:
+        memcpy(out, s.y, s.n * sizeof(double))
+    elif s.has_t_old and t == s.t_old:
+        memcpy(out, s.y_old, s.n * sizeof(double))
+    else:
+        fni_solver_dense_eval(s, t, out)
+
+
+cdef inline int _tangent_jac(const fni_solver* s, fni_tangent* tg, _tangent_work* w,
+                             double t, double* J) noexcept nogil:
+    _y_at(s, t, w.y_node)
+    tg.n_jac += 1
+    if tg.jac(t, w.y_node, s.n, tg.ctx, J) != 0:
+        return FNI_ERR_CALLBACK
+    return FNI_OK
+
+
+cdef int _tangent_piece(const fni_solver* s, fni_tangent* tg, _tangent_work* w, double a,
+                        double b, const double* Ja, double* err) noexcept nogil:
+    """Advance X over [a, b] by classical RK4 with J(a) given and J at the middle and
+    at b evaluated (into w.Jm, w.Jn). ``err`` receives the RMS of RK4 against Kutta's
+    third-order solution from the same Jacobians, scaled by (rtol, atol)."""
+    cdef Py_ssize_t n = s.n, nm = s.n * tg.m, i
+    cdef double h = b - a, d, sc, acc = 0.0, x4, x3
+    cdef double* X = tg.X
+    cdef int rc = _tangent_jac(s, tg, w, 0.5 * (a + b), w.Jm)
+    if rc == FNI_OK:
+        rc = _tangent_jac(s, tg, w, b, w.Jn)
+    if rc != FNI_OK:
+        return rc
+    _tangent_mul(tg, n, Ja, X, w.k1)
+    for i in range(nm):
+        w.tmp[i] = X[i] + 0.5 * h * w.k1[i]
+    _tangent_mul(tg, n, w.Jm, w.tmp, w.k2)
+    for i in range(nm):
+        w.tmp[i] = X[i] + 0.5 * h * w.k2[i]
+    _tangent_mul(tg, n, w.Jm, w.tmp, w.k3)
+    for i in range(nm):
+        w.tmp[i] = X[i] + h * w.k3[i]
+    _tangent_mul(tg, n, w.Jn, w.tmp, w.k4)
+    for i in range(nm):
+        w.tmp[i] = X[i] - h * w.k1[i] + 2.0 * h * w.k2[i]
+    _tangent_mul(tg, n, w.Jn, w.tmp, w.k5)
+    for i in range(nm):
+        x4 = X[i] + h / 6.0 * (w.k1[i] + 2.0 * w.k2[i] + 2.0 * w.k3[i] + w.k4[i])
+        x3 = X[i] + h / 6.0 * (w.k1[i] + 4.0 * w.k2[i] + w.k5[i])
+        sc = tg.atol + tg.rtol * (fabs(X[i]) if fabs(X[i]) > fabs(x4) else fabs(x4))
+        d = (x4 - x3) / sc if sc > 0 else (0.0 if x4 == x3 else INFINITY)
+        acc += d * d
+        X[i] = x4
+    err[0] = sqrt(acc / nm) if nm > 0 else 0.0
+    return FNI_OK
+
+
+cdef int _tangent_advance(const fni_solver* s, fni_tangent* tg, _tangent_work* w,
+                          double b) noexcept nogil:
+    """Advance X from w.t_tan to ``b``, both in the current step (dense output valid).
+    The interval is one RK4 piece, or 2**k equal pieces (k <= max_depth) when the
+    error estimate asks for it; J at ``b`` is kept for the next interval."""
+    cdef double a = w.t_tan, ta, tb, err, worst
+    cdef Py_ssize_t nm = s.n * tg.m, pieces, q, depth = 0
+    cdef Py_ssize_t nbytes = w.nnz * sizeof(double)
+    cdef int rc
+    if b == a:
+        return FNI_OK
+    if nm == 0:
+        w.t_tan = b
+        return FNI_OK
+    if not w.have_ja:
+        rc = _tangent_jac(s, tg, w, a, w.Ja)
+        if rc != FNI_OK:
+            return rc
+        w.have_ja = True
+    memcpy(w.x0, tg.X, nm * sizeof(double))
+    while True:
+        pieces = (<Py_ssize_t> 1) << depth
+        memcpy(w.Jb, w.Ja, nbytes)
+        ta = a
+        worst = 0.0
+        for q in range(pieces):
+            tb = b if q == pieces - 1 else a + (b - a) * (q + 1) / pieces
+            rc = _tangent_piece(s, tg, w, ta, tb, w.Jb, &err)
+            if rc != FNI_OK:
+                return rc
+            tg.n_pieces += 1
+            if err > worst:
+                worst = err
+            memcpy(w.Jb, w.Jn, nbytes)
+            ta = tb
+        if worst <= 1.0 or depth >= tg.max_depth:
+            break
+        depth += 1
+        memcpy(tg.X, w.x0, nm * sizeof(double))
+    memcpy(w.Ja, w.Jb, nbytes)
+    w.t_tan = b
+    return FNI_OK
+
+
 cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
                               double t0, const double* y0, double t1, const fni_options* opt,
                               const fni_event* events, Py_ssize_t n_events,
@@ -1216,7 +1465,31 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
                               double* record_y, double* record_y_after, bint* record_reset,
                               Py_ssize_t max_records,
                               fni_stats* stats, Py_ssize_t* n_resets) noexcept nogil:
+    """:func:`fni_integrate_hybrid_tangent` without a tangent."""
+    return fni_integrate_hybrid_tangent(method, fun, ctx, n, t0, y0, t1, opt, events,
+                                        n_events, reset, reset_ctx, hopt, y_out, record_event,
+                                        record_t, record_y, record_y_after, record_reset,
+                                        max_records, stats, n_resets, NULL)
+
+
+cdef int fni_integrate_hybrid_tangent(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t n,
+                                      double t0, const double* y0, double t1,
+                                      const fni_options* opt,
+                                      const fni_event* events, Py_ssize_t n_events,
+                                      fni_reset_fn reset, void* reset_ctx,
+                                      const fni_hybrid_options* hopt,
+                                      double* y_out, Py_ssize_t* record_event,
+                                      double* record_t, double* record_y,
+                                      double* record_y_after, bint* record_reset,
+                                      Py_ssize_t max_records,
+                                      fni_stats* stats, Py_ssize_t* n_resets,
+                                      fni_tangent* tangent) noexcept nogil:
     """Integrate a hybrid system from (t0, y0) to t1 without the GIL.
+
+    With ``tangent`` (may be NULL), its ``X`` is carried along by the decoupled tangent
+    propagator (see ``fni_tangent``): advanced over each accepted step, to an event
+    before a reset, and mapped across each reset by ``tangent.reset``. On return it
+    holds X at ``stats.t_final``.
 
     As :func:`fni_integrate`, except that a terminal event is a *guard*: when
     it fires, ``reset`` maps the state in place and integration continues from
@@ -1246,6 +1519,11 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
     cdef double* tmp
     cdef int rc, hstatus
     cdef double t_event = NAN
+    cdef _tangent_work tw
+    cdef bint applied
+    cdef const fni_tableau* tab = fni_get_tableau(method)
+    cdef Py_ssize_t size_s, size_sc, size_h, size_w, size_t = 0
+    cdef double* block = NULL
 
     stats.status = FNI_STATUS_FAILED
     stats.t_final = t0
@@ -1255,34 +1533,41 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
     stats.n_records = 0
     if n_resets != NULL:
         n_resets[0] = 0
-    h.masked = NULL
-    h.t_probe = NULL
-    h.t_fired = NULL
-    h.g_pending = NULL
+    if tab == NULL or n < 0:
+        return FNI_ERR_ARG
+    if tangent != NULL:
+        tangent.n_jac = 0
+        tangent.n_pieces = 0
+        size_t = _tangent_mem_size(tangent, n)
+        if size_t < 0:
+            return FNI_ERR_ARG
+    # One allocation for the call: the solver, the guard bookkeeping, the event scan,
+    # the event values and the tangent's work.
+    size_s = _solver_mem_size(tab, n)
+    size_h = _hybrid_mem_size(n_events)
+    size_sc = _scan_mem_size(n_events, n)
+    size_w = 3 * n_events + (n if n > 0 else 1) + 1
+    block = <double*> malloc((size_s + size_h + size_sc + size_w + size_t) * sizeof(double))
+    if block == NULL:
+        return FNI_ERR_ALLOC
+    s.mem = NULL                 # the block's, freed below
     scan.mem = NULL
-
-    rc = fni_solver_init(&s, method, fun, ctx, n, t0, y0, t1, opt)
-    if rc == FNI_OK:
-        rc = fni_hybrid_init(&h, n_events)
-    if rc == FNI_OK:
-        rc = fni_event_scan_init(&scan, n_events, n)
+    rc = _solver_init_on(&s, tab, fun, ctx, n, t0, y0, t1, opt, block)
     if rc != FNI_OK:
-        fni_solver_free(&s)
-        fni_hybrid_free(&h)
-        fni_event_scan_free(&scan)
+        free(block)
         return rc
-
-    work = <double*> malloc((3 * n_events + (n if n > 0 else 1) + 1) * sizeof(double))
-    if work == NULL:
-        rc = FNI_ERR_ALLOC
-    else:
-        g = work
-        g_new = g + n_events
-        counts = g_new + n_events
-        y_event = counts + n_events
-        for e in range(n_events):
-            counts[e] = 0.0
-        rc = fni_events_eval(events, n_events, t0, s.y, n, g)
+    _hybrid_init_on(&h, n_events, block + size_s)
+    _scan_init_on(&scan, n_events, n, block + size_s + size_h)
+    work = block + size_s + size_h + size_sc
+    if tangent != NULL:
+        _tangent_work_init(&tw, tangent, n, t0, work + size_w)
+    g = work
+    g_new = g + n_events
+    counts = g_new + n_events
+    y_event = counts + n_events
+    for e in range(n_events):
+        counts[e] = 0.0
+    rc = fni_events_eval(events, n_events, t0, s.y, n, g)
 
     while rc == FNI_OK:
         rc = fni_solver_step(&s)
@@ -1321,10 +1606,26 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
 
         if terminate:
             fni_solver_dense_eval(&s, t_event, y_event)
+            if tangent != NULL:
+                # X to the event, on the step's dense output, before the reset moves y.
+                rc = fni_solver_ensure_dense(&s)
+                if rc == FNI_OK:
+                    rc = _tangent_advance(&s, tangent, &tw, t_event)
+                if rc != FNI_OK:
+                    break
+                memcpy(tw.y_before, y_event, n * sizeof(double))
             rc = fni_hybrid_reset(&s, &h, hopt, events, n_events, counts, e_found,
                                   t_event, y_event, reset, reset_ctx, g, &hstatus)
             if rc != FNI_OK:
                 break
+            applied = reset != NULL and (hstatus == 2 or hstatus == FNI_STATUS_EVENT)
+            if tangent != NULL and applied:
+                tw.have_ja = False
+                if tangent.reset != NULL and tangent.reset(
+                        e_found, t_event, tw.y_before, y_event, tangent.X, n, tangent.m,
+                        tangent.reset_ctx) != 0:
+                    rc = FNI_ERR_CALLBACK
+                    break
             if last == stats.n_records - 1 and reset != NULL and (
                     hstatus == 2 or hstatus == FNI_STATUS_EVENT):
                 if record_y_after != NULL:
@@ -1338,6 +1639,12 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
                 break
             continue
 
+        if tangent != NULL:
+            rc = fni_solver_ensure_dense(&s)
+            if rc == FNI_OK:
+                rc = _tangent_advance(&s, tangent, &tw, s.t)
+            if rc != FNI_OK:
+                break
         if n_events > 0:
             fni_hybrid_unmask(&h, n_events, g_new)
             tmp = g
@@ -1354,11 +1661,7 @@ cdef int fni_integrate_hybrid(int method, fni_rhs_fn fun, void* ctx, Py_ssize_t 
     stats.n_rejected = s.n_rejected
     if n_resets != NULL:
         n_resets[0] = h.n_resets
-    fni_solver_free(&s)
-    fni_hybrid_free(&h)
-    fni_event_scan_free(&scan)
-    if work != NULL:
-        free(work)
+    free(block)
     return rc
 
 
@@ -1870,6 +2173,128 @@ cdef class ScaleComponent(ResetMap):
 # =============================================================================
 # Dense output
 # =============================================================================
+
+
+cdef class Jacobian:
+    """Base class for the Jacobian ``J = df/dy`` of :func:`integrate_tangent`.
+
+    Subclass in Cython and either set ``c_fn`` (a ``nogil`` :c:type:`fni_jacobian_fn`)
+    and ``c_ctx``, which also works with the GIL-free C API, or override the ``cdef``
+    method ``eval``. ``J`` is dense row-major ``n x n``, or, with a sparsity pattern,
+    the pattern's nonzero values in CSR order.
+    """
+
+    def __cinit__(self, *args, **kwargs):
+        self.c_fn = NULL
+        self.c_ctx = NULL
+
+    @property
+    def has_native_fn(self):
+        return self.c_fn != NULL
+
+    cdef int eval(self, double t, const double* y, Py_ssize_t n, double* J) except -1:
+        if self.c_fn == NULL:
+            raise NotImplementedError(f"{type(self).__name__} must implement eval() or set c_fn")
+        if self.c_fn(t, y, n, self.c_ctx, J) != 0:
+            raise RuntimeError(f"{type(self).__name__}: native Jacobian returned an error code")
+        return 0
+
+
+cdef class PythonJacobian(Jacobian):
+    """Adapter for a callable ``jac(t, y, *args)`` returning the dense ``n x n`` matrix
+    (on a sparsity pattern, only its pattern's entries are used)."""
+
+    cdef object fun
+    cdef tuple args
+    cdef object rows
+    cdef object cols
+
+    def __init__(self, fun, args=(), pattern=None):
+        if not callable(fun):
+            raise TypeError("jac must be callable")
+        self.fun = fun
+        self.args = tuple(args)
+        self.rows = self.cols = None
+        if pattern is not None:
+            self.rows, self.cols = pattern
+
+    cdef int eval(self, double t, const double* y, Py_ssize_t n, double* J) except -1:
+        cdef Py_ssize_t i, k
+        arr = np.asarray(self.fun(t, _array_from(y, n), *self.args), dtype=np.float64)
+        if arr.shape != (n, n):
+            raise ValueError(f"jac returned shape {arr.shape} for a state of size {n}")
+        if self.rows is not None:
+            arr = arr[self.rows, self.cols]
+        cdef const double[::1] v = np.ascontiguousarray(arr).reshape(-1)
+        k = v.shape[0]
+        for i in range(k):
+            J[i] = v[i]
+        return 0
+
+
+cdef class TangentReset:
+    """Base class for the map of a tangent across a reset (:func:`integrate_tangent`).
+
+    Receives the event index, the time, the states just before and just after the
+    reset, and the tangent ``X`` (``n x m``, row-major), which it overwrites in place.
+    Set ``c_fn`` (a ``nogil`` :c:type:`fni_tangent_reset_fn`) and ``c_ctx``, or
+    override the ``cdef`` method ``eval``.
+    """
+
+    def __cinit__(self, *args, **kwargs):
+        self.c_fn = NULL
+        self.c_ctx = NULL
+
+    @property
+    def has_native_fn(self):
+        return self.c_fn != NULL
+
+    cdef int eval(self, Py_ssize_t event, double t, const double* y_before,
+                  const double* y_after, double* X, Py_ssize_t n, Py_ssize_t m) except -1:
+        if self.c_fn == NULL:
+            raise NotImplementedError(f"{type(self).__name__} must implement eval() or set c_fn")
+        if self.c_fn(event, t, y_before, y_after, X, n, m, self.c_ctx) != 0:
+            raise RuntimeError(f"{type(self).__name__}: native tangent reset returned an error code")
+        return 0
+
+
+cdef class PythonTangentReset(TangentReset):
+    """Adapter for a callable ``tangent_reset(event, t, y_before, y_after, X, *args)``
+    returning the tangent after the reset (``n x m``)."""
+
+    cdef object fun
+    cdef tuple args
+
+    def __init__(self, fun, args=()):
+        if not callable(fun):
+            raise TypeError("tangent_reset must be callable")
+        self.fun = fun
+        self.args = tuple(args)
+
+    cdef int eval(self, Py_ssize_t event, double t, const double* y_before,
+                  const double* y_after, double* X, Py_ssize_t n, Py_ssize_t m) except -1:
+        cdef Py_ssize_t i
+        Xa = np.array(<double[:n * m]> X if n * m > 0 else np.zeros(0), copy=True).reshape(n, m)
+        out = np.asarray(self.fun(event, t, _array_from(y_before, n), _array_from(y_after, n),
+                                  Xa, *self.args), dtype=np.float64)
+        if out.shape != (n, m):
+            raise ValueError(f"tangent_reset returned shape {out.shape}, expected {(n, m)}")
+        cdef const double[::1] v = np.ascontiguousarray(out).reshape(-1)
+        for i in range(n * m):
+            X[i] = v[i]
+        return 0
+
+
+cdef int _jacobian_trampoline(double t, const double* y, Py_ssize_t n, void* ctx,
+                              double* J) except -1:
+    return (<Jacobian> ctx).eval(t, y, n, J)
+
+
+cdef int _tangent_reset_trampoline(Py_ssize_t event, double t, const double* y_before,
+                                   const double* y_after, double* X, Py_ssize_t n,
+                                   Py_ssize_t m, void* ctx) except -1:
+    return (<TangentReset> ctx).eval(event, t, y_before, y_after, X, n, m)
+
 
 cdef class OdeSolution:
     """Piecewise dense-output interpolant (the ``sol`` of scipy's result).
@@ -2850,9 +3275,62 @@ def integrate_hybrid(fun, t_span, y0, events, reset, method="RK45", *, rtol=1e-3
                       n_interior)
 
 
+def integrate_tangent(fun, t_span, y0, jac, X0=None, method="DOP853", *, rtol=1e-3,
+                      atol=1e-6, tangent_rtol=1e-8, tangent_atol=1e-10, max_depth=4,
+                      sparsity=None, events=None, reset=None, tangent_reset=None,
+                      first_step=None, max_step=np.inf, args=None, max_resets=10000,
+                      min_dwell=0.0, reselect_step=False, max_records=1024,
+                      release_gil=None, event_detection="endpoints", n_interior=4):
+    """Integrate ``y`` to the end of ``t_span`` with a decoupled tangent ``X``.
+
+    ``y`` follows :func:`integrate_hybrid` (with ``events`` and ``reset``) or
+    :func:`integrate` exactly: the same steps, events and resets. Alongside it, the
+    *decoupled tangent propagator* advances ``X' = J(t, y(t)) X`` from ``X0`` (default
+    the identity, so that ``X`` is the state transition matrix). After each accepted
+    step of ``y``, or the part of one before a reset, ``X`` is advanced over it by
+    the classical fourth-order Runge-Kutta scheme. ``J`` is evaluated at the step's
+    ends and middle, with ``y`` there from the step's dense output, and the step's
+    end value is reused at the next step's start: two Jacobian evaluations per step.
+    An embedded third-order solution estimates the error of ``X``. Where it exceeds
+    ``(tangent_rtol, tangent_atol)``, the step is split for ``X`` only, into up to
+    ``2**max_depth`` pieces. ``y`` is unaffected by ``X``.
+
+    ``X`` approximates the solution of the variational equation, not the derivative
+    of the numerical flow of ``y``. It is not part of ``y``'s error control, and it
+    costs no stages of ``y``'s method.
+
+    Parameters
+    ----------
+    jac : callable or Jacobian
+        ``jac(t, y, *args)`` returning ``df/dy`` (``n x n``), or a native
+        :class:`Jacobian`.
+    X0 : array_like, shape (n, m), optional
+        The tangent at ``t0`` (default: the identity).
+    sparsity : array_like of bool, shape (n, n), optional
+        The pattern of ``J``. A native :class:`Jacobian` then writes only the pattern's
+        values, in row-major (CSR) order, and the products cost one term per nonzero.
+    tangent_reset : callable or TangentReset, optional
+        ``tangent_reset(event, t, y_before, y_after, X, *args)`` returning the tangent
+        after a reset (``n x m``); without it ``X`` is continuous across resets.
+
+    Returns
+    -------
+    OdeResult
+        The fields of :func:`integrate_hybrid` (or :func:`integrate` without
+        ``events``), plus ``X`` (at ``t``), ``n_jac`` (Jacobian evaluations) and
+        ``n_tangent_pieces`` (RK4 pieces for ``X``).
+    """
+    hybrid = (_hybrid_options(max_resets, min_dwell, reselect_step)
+              if reset is not None else None)
+    return _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events, args,
+                      max_records, release_gil, reset, hybrid, event_detection, n_interior,
+                      {"jac": jac, "X0": X0, "sparsity": sparsity, "reset": tangent_reset,
+                       "rtol": tangent_rtol, "atol": tangent_atol, "max_depth": max_depth})
+
+
 cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step, events,
                        args, max_records, release_gil, reset, hybrid, event_detection,
-                       n_interior):
+                       n_interior, tangent=None):
     cdef fni_options opt
     cdef fni_hybrid_options hopt
     cdef fni_reset_fn reset_fn = NULL
@@ -2871,6 +3349,12 @@ cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step
     cdef double t0, t1
     cdef bint nogil_ok
     cdef _EventArray ev_array
+    cdef fni_tangent tg
+    cdef fni_tangent* tgp = NULL
+    cdef Jacobian jac_obj = None
+    cdef TangentReset treset_obj = None
+    cdef double[::1] X_view
+    cdef Py_ssize_t[::1] row_ptr_view, col_idx_view
 
     solver_cls = _resolve_method(method)
     m = METHOD_IDS[solver_cls.__name__] if solver_cls.__name__ in METHOD_IDS else -1
@@ -2931,23 +3415,74 @@ cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step
         hopt.max_resets = -1
         hopt.min_dwell = 0.0
         hopt.reselect_step = False
+    if tangent is not None:
+        fni_tangent_init(&tg)
+        X0 = tangent["X0"]
+        X_arr = (np.eye(n) if X0 is None else np.array(X0, dtype=np.float64, copy=True))
+        if X_arr.ndim != 2 or X_arr.shape[0] != n:
+            raise ValueError(f"`X0` must have shape (n, m) with n = {n}")
+        tm = X_arr.shape[1]
+        X_arr = np.ascontiguousarray(X_arr)
+        X_view = X_arr.reshape(-1) if n * tm > 0 else np.zeros(1)
+        pattern = tangent["sparsity"]
+        rows_cols = None
+        if pattern is not None:
+            pat = np.asarray(pattern, dtype=bool)
+            if pat.shape != (n, n):
+                raise ValueError(f"`sparsity` must have shape {(n, n)}")
+            rows, cols = np.nonzero(pat)          # row-major order: CSR order
+            rows_cols = (rows, cols)
+            row_ptr_view = np.concatenate([[0], np.cumsum(pat.sum(axis=1))]).astype(np.intp)
+            col_idx_view = cols.astype(np.intp) if cols.size else np.zeros(1, dtype=np.intp)
+            tg.row_ptr = &row_ptr_view[0]
+            tg.col_idx = &col_idx_view[0]
+        jac = tangent["jac"]
+        jac_obj = jac if isinstance(jac, Jacobian) else PythonJacobian(
+            jac, () if args is None else args, rows_cols)
+        if jac_obj.c_fn != NULL:
+            tg.jac = jac_obj.c_fn
+            tg.ctx = jac_obj.c_ctx
+        else:
+            tg.jac = <fni_jacobian_fn> _jacobian_trampoline
+            tg.ctx = <void*> jac_obj
+        nogil_ok = nogil_ok and jac_obj.c_fn != NULL
+        tr = tangent["reset"]
+        if tr is not None:
+            treset_obj = tr if isinstance(tr, TangentReset) else PythonTangentReset(
+                tr, () if args is None else args)
+            if treset_obj.c_fn != NULL:
+                tg.reset = treset_obj.c_fn
+                tg.reset_ctx = treset_obj.c_ctx
+            else:
+                tg.reset = <fni_tangent_reset_fn> _tangent_reset_trampoline
+                tg.reset_ctx = <void*> treset_obj
+            nogil_ok = nogil_ok and treset_obj.c_fn != NULL
+        tg.m = tm
+        tg.X = &X_view[0]
+        tg.rtol = float(tangent["rtol"])
+        tg.atol = float(tangent["atol"])
+        tg.max_depth = int(tangent["max_depth"])
+        tgp = &tg
     if release_gil is None:
         release_gil = nogil_ok
     elif release_gil and not nogil_ok:
-        raise TypeError("release_gil=True needs a native c_fn on the system, every event "
-                        "and the reset map")
+        raise TypeError("release_gil=True needs a native c_fn on the system, every event, "
+                        "the reset map and the tangent's callbacks")
 
     if release_gil:
         with nogil:
-            rc = fni_integrate_hybrid(m, fn, ctx, n, t0, &y0_view[0], t1, &opt, ev_array.ev,
-                                      ev_array.n, reset_fn, reset_ctx, &hopt, &y_out[0],
-                                      &rec_e[0], &rec_t[0], &rec_y_flat[0], &rec_y_after[0],
-                                      <bint*> &rec_reset[0], cap, &stats, &n_resets)
+            rc = fni_integrate_hybrid_tangent(m, fn, ctx, n, t0, &y0_view[0], t1, &opt,
+                                              ev_array.ev, ev_array.n, reset_fn, reset_ctx,
+                                              &hopt, &y_out[0], &rec_e[0], &rec_t[0],
+                                              &rec_y_flat[0], &rec_y_after[0],
+                                              <bint*> &rec_reset[0], cap, &stats, &n_resets,
+                                              tgp)
     else:
-        rc = fni_integrate_hybrid(m, fn, ctx, n, t0, &y0_view[0], t1, &opt, ev_array.ev,
-                                  ev_array.n, reset_fn, reset_ctx, &hopt, &y_out[0],
-                                  &rec_e[0], &rec_t[0], &rec_y_flat[0], &rec_y_after[0],
-                                  <bint*> &rec_reset[0], cap, &stats, &n_resets)
+        rc = fni_integrate_hybrid_tangent(m, fn, ctx, n, t0, &y0_view[0], t1, &opt,
+                                          ev_array.ev, ev_array.n, reset_fn, reset_ctx, &hopt,
+                                          &y_out[0], &rec_e[0], &rec_t[0], &rec_y_flat[0],
+                                          &rec_y_after[0], <bint*> &rec_reset[0], cap, &stats,
+                                          &n_resets, tgp)
     _check(rc)
 
     if ev_array.n > 0:
@@ -2969,6 +3504,10 @@ cdef object _integrate(fun, t_span, y0, method, rtol, atol, first_step, max_step
         t_events=t_events, y_events=y_events, n_event_records=stats.n_records,
         gil_released=bool(release_gil),
     )
+    if tgp != NULL:
+        out.X = X_arr
+        out.n_jac = tg.n_jac
+        out.n_tangent_pieces = tg.n_pieces
     if hybrid is not None:
         k_rec = min(stats.n_records, cap)
         is_reset = np.asarray(rec_reset)[:k_rec].astype(bool)

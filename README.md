@@ -290,6 +290,67 @@ the derivative of `g`. Its roots are the peaks and troughs of `g`, and `g` is
 monotone between them, so it can cross zero at most once on each piece, and
 the split finds that crossing.
 
+### Decoupled tangent propagator: sensitivities without the stages
+
+Newton's method, continuation and shooting need the flow's sensitivities, the
+tangent `X(t) = dy(t)/dy0`. The usual way appends `X` to the state and lets the
+integrator carry it through every stage. Then the variational right-hand side,
+the expensive part, is evaluated at every stage, often for a precision the
+caller doesn't need.
+
+`integrate_tangent` decouples the two. `y` is integrated exactly as by
+`integrate` (or `integrate_hybrid`, with events and resets): the same steps,
+the same results, bit for bit. `X' = J(t, y(t)) X` is advanced separately:
+
+- **Per accepted step** of `y`, or the part of one before a reset, `X` takes one
+  classical fourth-order Runge-Kutta step. `J` is evaluated at the step's ends and
+  middle, with `y` there from the step's dense output. The end value is reused at
+  the next step's start, so a step costs two Jacobian evaluations, whatever the
+  method of `y`.
+- **Its own error control:** an embedded third-order (Kutta) solution from the
+  same Jacobians estimates the error of `X`. When it exceeds
+  `(tangent_rtol, tangent_atol)`, the step is split for `X` only, into up to
+  `2**max_depth` pieces. The steps of `y` are never shortened for `X`.
+- **Resets:** at a guard, `X` is advanced to the event, and the reset map's
+  tangent counterpart maps it across the jump. For a flow's sensitivities that
+  is `X <- S X`, with `S` the saltation matrix. Without a tangent reset, `X` is
+  continuous across the reset.
+- **Sparsity:** with a pattern for `J`, a native Jacobian writes only its
+  nonzero values (CSR order), and each product costs one term per nonzero.
+
+```python
+import numpy as np
+from fast_numerical_integration.integrators import integrate_tangent
+
+def f(t, y):
+    return np.array([y[1], 2.0 * (1 - y[0] ** 2) * y[1] - y[0]])
+
+def jac(t, y):
+    return np.array([[0.0, 1.0], [-4.0 * y[0] * y[1] - 1.0, 2.0 * (1 - y[0] ** 2)]])
+
+res = integrate_tangent(f, (0, 4), [2.0, 0.0], jac, rtol=1e-10, atol=1e-12,
+                        tangent_rtol=1e-8)
+res.y, res.X, res.n_jac               # X approximates dy(4)/dy(0)
+```
+
+`X` approximates the solution of the variational equation, not the
+derivative of the numerical flow of `y`. That distinction matters only below
+the tangent's tolerance. It is what Newton's method needs: a chord iteration
+converges with an approximate Jacobian.
+
+Where the scheme pays: when each step of `y` is short, for example between
+frequent events, so that `X` needs one or two pieces per step. Then the
+tangent costs about three Jacobian-sized evaluations per step, against one
+variational evaluation per stage (twelve for DOP853). On long, smooth steps a
+fourth-order `X` needs many pieces, and appending `X` to the state is the
+better choice.
+
+In C, `fni_integrate_hybrid_tangent` runs the same loop inside `with nogil`.
+It takes an `fni_tangent` (`fni_tangent_init` sets the defaults) with an
+`fni_jacobian_fn` and an optional `fni_tangent_reset_fn`.
+`fni_integrate_hybrid` is the same call without a tangent. Subclass
+`Jacobian` and `TangentReset` with a native `c_fn` for GIL-free runs.
+
 ## Installation
 
 ```bash
@@ -420,6 +481,10 @@ require before merging.
 - [x] **Milestone 3f** — Event detection inside a step: roots split the step
       for the other events, opt-in interior test points
       (`event_detection="interior"`), `fni_options_init` (0.4.0).
+- [x] **Milestone 3g** — Decoupled tangent propagator: `integrate_tangent`,
+      `fni_integrate_hybrid_tangent`, `Jacobian` and `TangentReset`, with the
+      tangent's own error control, sparsity and tangent resets. One allocation
+      per C-level integration (0.5.0).
 - SymPy code generation lives in the companion package
   [auto-optimal-control](https://github.com/idm23/auto-optimal-control),
   which builds its compiled kernels on this C API.
