@@ -1,6 +1,6 @@
 # A minimal downstream package that cimports fast-numerical-integration's C API.
 # Built in the release workflow against the freshly built wheel, to prove the
-# shipped .pxd files support exactly what auto-optimal-control will do.
+# shipped .pxd files are enough to cimport the C API from another package.
 [build-system]
 requires = ["setuptools>=77", "cython>=3.0", "fast-numerical-integration"]
 build-backend = "setuptools.build_meta"

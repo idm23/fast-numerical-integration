@@ -8,8 +8,8 @@ unchanged::
           vx1, vy1, vx2, vy2, vx3, vy3 ]     # velocities (6)
 
 The right-hand side signature mirrors ``f(t, y)`` expected by ``solve_ivp`` so it
-is a drop-in RHS for any of our solvers. It is written in a form that a
-SymPy -> C code printer can later replace with a compiled kernel.
+is a drop-in RHS for any of our solvers. Its native counterpart, a GIL-free C
+right-hand side, is :mod:`fast_numerical_integration.nbody`.
 """
 
 from dataclasses import dataclass
